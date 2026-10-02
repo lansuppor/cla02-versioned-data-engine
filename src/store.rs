@@ -82,6 +82,8 @@ pub struct WriteOutcome {
     pub accepted: usize,
     /// 实际新增的记录数（与已有记录完全相同的写入幂等，不计入）。
     pub inserted: usize,
+    /// `replace=true` 时被新内容覆盖的已有记录数（内容相同的幂等写入不计入）。
+    pub replaced: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,10 +109,15 @@ struct VersionSnap {
 }
 
 /// WAL 中的事件：已确认提交的一批记录。
+///
+/// `replace` 缺省（旧版本 WAL）时按 `false` 反序列化；两种事件在重放时都是按主键
+/// upsert，语义一致——`replace` 只影响提交时的冲突校验，不影响重放动作本身。
 #[derive(Serialize, Deserialize)]
 struct CommitEvent {
     collection: String,
     records: Vec<Record>,
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,10 +247,15 @@ impl Store {
     }
 
     /// 批量写入：整批校验通过后原子提交，任一条不合法则整批拒绝、已有数据不变。
+    ///
+    /// `replace=false`（默认）时，同主键不同内容整批拒绝；`replace=true` 时允许用
+    /// 新内容覆盖同主键的已有记录。两种模式下同批主键重复、非法记录等校验完全一致，
+    /// 且任一记录不合法时整批不生效（包括不会发生任何替换）。
     pub fn write_batch(
         &self,
         collection: &str,
         batch: &[Value],
+        replace: bool,
     ) -> Result<WriteOutcome, BatchError> {
         if collection.is_empty() {
             return Err(BatchError::Rejected(Rejection {
@@ -315,8 +327,9 @@ impl Store {
             prepared.push(rec.clone());
         }
 
-        // 阶段 2：与集合中已有记录冲突检查——同主键但内容不同即拒绝整批。
-        if let Some(existing) = st.current.get(collection) {
+        // 阶段 2：与集合中已有记录冲突检查——replace=false 时同主键不同内容拒绝整批；
+        // replace=true 时同主键不同内容将在提交阶段覆盖，此处跳过。
+        if !replace && let Some(existing) = st.current.get(collection) {
             for (i, rec) in prepared.iter().enumerate() {
                 let id = rec["id"].as_str().unwrap();
                 if let Some(old) = existing.iter().find(|r| r["id"] == id)
@@ -337,15 +350,23 @@ impl Store {
         let event = CommitEvent {
             collection: collection.to_string(),
             records: prepared.clone(),
+            replace,
         };
         append_wal(&mut st.wal, &event).map_err(BatchError::Persist)?;
 
         let existing = st.current.entry(collection.to_string()).or_default();
         let mut inserted = 0usize;
+        let mut replaced = 0usize;
         for rec in prepared {
             let id = rec["id"].as_str().unwrap();
             match existing.iter().position(|r| r["id"] == id) {
-                Some(pos) => existing[pos] = rec, // 内容相同：幂等写入
+                Some(pos) => {
+                    // 内容相同为幂等写入；内容不同（只可能发生在 replace=true）计为替换。
+                    if existing[pos] != rec {
+                        replaced += 1;
+                    }
+                    existing[pos] = rec;
+                }
                 None => {
                     existing.push(rec);
                     inserted += 1;
@@ -357,6 +378,7 @@ impl Store {
             collection: collection.to_string(),
             accepted: batch.len(),
             inserted,
+            replaced,
         })
     }
 
@@ -638,7 +660,11 @@ mod unit_tests {
         let dir = temp_dir();
         let store = Store::open(&dir).unwrap();
         let ok = store
-            .write_batch("users", &[json!({"id": "u1", "name": "Ada", "age": 36})])
+            .write_batch(
+                "users",
+                &[json!({"id": "u1", "name": "Ada", "age": 36})],
+                false,
+            )
             .unwrap();
         assert_eq!(ok.inserted, 1);
 
@@ -650,6 +676,7 @@ mod unit_tests {
                     json!({"id": "u2", "score": 100}),
                     json!({"id": "u3", "score": 9.5}),
                 ],
+                false,
             )
             .unwrap_err();
         match err {
@@ -663,7 +690,7 @@ mod unit_tests {
 
         // 缺主键。
         let err = store
-            .write_batch("users", &[json!({"name": "NoId"})])
+            .write_batch("users", &[json!({"name": "NoId"})], false)
             .unwrap_err();
         match err {
             BatchError::Rejected(r) => assert!(r.reason.contains("missing primary key")),
@@ -672,7 +699,7 @@ mod unit_tests {
 
         // 同批重复主键。
         let err = store
-            .write_batch("users", &[json!({"id": "d1"}), json!({"id": "d1"})])
+            .write_batch("users", &[json!({"id": "d1"}), json!({"id": "d1"})], false)
             .unwrap_err();
         match err {
             BatchError::Rejected(r) => assert!(r.reason.contains("duplicate id")),
@@ -681,7 +708,11 @@ mod unit_tests {
 
         // 同主键不同内容 → 拒绝。
         let err = store
-            .write_batch("users", &[json!({"id": "u1", "name": "Ada", "age": 37})])
+            .write_batch(
+                "users",
+                &[json!({"id": "u1", "name": "Ada", "age": 37})],
+                false,
+            )
             .unwrap_err();
         match err {
             BatchError::Rejected(r) => assert!(r.reason.contains("different record")),
@@ -690,7 +721,7 @@ mod unit_tests {
 
         // 数组字段拒绝。
         let err = store
-            .write_batch("users", &[json!({"id": "u4", "tags": ["a"]})])
+            .write_batch("users", &[json!({"id": "u4", "tags": ["a"]})], false)
             .unwrap_err();
         match err {
             BatchError::Rejected(r) => assert!(r.reason.contains("arrays")),
@@ -713,13 +744,14 @@ mod unit_tests {
             .write_batch(
                 "users",
                 &[json!({"id": "u1", "z": 1, "a": true, "nested": {"y": 2, "b": null}})],
+                false,
             )
             .unwrap();
         let v1 = store.save_version().unwrap();
 
         // 覆盖写入并清空式替换（同内容幂等，不同内容拒绝，用新集合模拟后续变化）。
         store
-            .write_batch("users", &[json!({"id": "u2", "x": 2})])
+            .write_batch("users", &[json!({"id": "u2", "x": 2})], false)
             .unwrap();
         let _v2 = store.save_version().unwrap();
 
@@ -761,6 +793,7 @@ mod unit_tests {
                     json!({"id": "gone", "v": 1}),
                     json!({"id": "mod", "v": 1}),
                 ],
+                false,
             )
             .unwrap();
         let v1 = store.save_version().unwrap();
@@ -768,7 +801,7 @@ mod unit_tests {
         // v2：gone 被删除、mod 内容变化、new 新写入（写入接口不产生删除/修改，
         // 直接注入快照模拟这两个方向）。
         store
-            .write_batch("users", &[json!({"id": "new", "v": 9})])
+            .write_batch("users", &[json!({"id": "new", "v": 9})], false)
             .unwrap();
         let v2 = store.save_version().unwrap();
         {
@@ -778,18 +811,34 @@ mod unit_tests {
             let m = data.iter_mut().find(|r| r["id"] == "mod").unwrap();
             m.insert("v".to_string(), json!(2));
             let b = data.iter_mut().find(|r| r["id"] == "b").unwrap();
-            *b = json!({"y": 2, "id": "b", "x": 1}).as_object().unwrap().clone();
+            *b = json!({"y": 2, "id": "b", "x": 1})
+                .as_object()
+                .unwrap()
+                .clone();
         }
 
         let d = store.diff_versions(v1.id, v2.id, "users").unwrap();
         let added_ids: Vec<_> = d.added.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(added_ids, vec!["gone"]);
-        assert_eq!(Value::Object(d.added[0].clone()), json!({"id": "gone", "v": 1}));
-        let dropped_ids: Vec<_> = d.dropped.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            Value::Object(d.added[0].clone()),
+            json!({"id": "gone", "v": 1})
+        );
+        let dropped_ids: Vec<_> = d
+            .dropped
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
         assert_eq!(dropped_ids, vec!["new"]);
         assert_eq!(d.changed.len(), 1);
-        assert_eq!(Value::Object(d.changed[0].before.clone()), json!({"id": "mod", "v": 1}));
-        assert_eq!(Value::Object(d.changed[0].after.clone()), json!({"id": "mod", "v": 2}));
+        assert_eq!(
+            Value::Object(d.changed[0].before.clone()),
+            json!({"id": "mod", "v": 1})
+        );
+        assert_eq!(
+            Value::Object(d.changed[0].after.clone()),
+            json!({"id": "mod", "v": 2})
+        );
 
         // 起始版本晚于目标版本 → OutOfOrder。
         assert_eq!(
@@ -835,11 +884,12 @@ mod unit_tests {
                     json!({"id": "m1", "v": 1}),
                     json!({"id": "m0", "v": 1}),
                 ],
+                false,
             )
             .unwrap();
         let v1 = store.save_version().unwrap();
         store
-            .write_batch("c", &[json!({"id": "n2"}), json!({"id": "n10"})])
+            .write_batch("c", &[json!({"id": "n2"}), json!({"id": "n10"})], false)
             .unwrap();
         let v2 = store.save_version().unwrap();
         {
@@ -879,11 +929,11 @@ mod unit_tests {
         {
             let store = Store::open(&dir).unwrap();
             store
-                .write_batch("users", &[json!({"id": "u1", "v": 1})])
+                .write_batch("users", &[json!({"id": "u1", "v": 1})], false)
                 .unwrap();
             v1_id = store.save_version().unwrap().id;
             store
-                .write_batch("users", &[json!({"id": "u2", "v": 2})])
+                .write_batch("users", &[json!({"id": "u2", "v": 2})], false)
                 .unwrap();
         }
         // 重新打开：旧版本数据与保存后的 WAL 提交都应可见。
@@ -903,9 +953,13 @@ mod unit_tests {
         let dir = temp_dir();
         {
             let store = Store::open(&dir).unwrap();
-            store.write_batch("users", &[json!({"id": "u1"})]).unwrap();
+            store
+                .write_batch("users", &[json!({"id": "u1"})], false)
+                .unwrap();
             store.save_version().unwrap();
-            store.write_batch("users", &[json!({"id": "u2"})]).unwrap();
+            store
+                .write_batch("users", &[json!({"id": "u2"})], false)
+                .unwrap();
         }
         // 模拟崩溃：追加一段不完整的行。
         let wal_path = dir.join("wal.log");
@@ -921,6 +975,230 @@ mod unit_tests {
         let recs = store.read_records(v.id, "users").unwrap();
         let ids: Vec<_> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["u1", "u2"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_overwrites_records_and_reports_counts() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch(
+                "users",
+                &[json!({"id": "u1", "v": 1}), json!({"id": "u2", "v": 2})],
+                false,
+            )
+            .unwrap();
+        let v1 = store.save_version().unwrap();
+
+        // 一批中同时包含替换（u1）与新增（u3）；u2 不在批次内，保持不变。
+        let out = store
+            .write_batch(
+                "users",
+                &[
+                    json!({"id": "u1", "v": 10, "extra": "x"}),
+                    json!({"id": "u3", "v": 3}),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(out.accepted, 2);
+        assert_eq!(out.inserted, 1);
+        assert_eq!(out.replaced, 1);
+
+        // 当前数据为替换后的内容，且字段顺序按新记录保留。
+        let v2 = store.save_version().unwrap();
+        let recs = store.read_records(v2.id, "users").unwrap();
+        let by_id: std::collections::HashMap<_, _> = recs
+            .iter()
+            .map(|r| (r["id"].as_str().unwrap(), r))
+            .collect();
+        assert_eq!(
+            Value::Object(by_id["u1"].clone()),
+            json!({"id": "u1", "v": 10, "extra": "x"})
+        );
+        let keys: Vec<_> = by_id["u1"].keys().cloned().collect();
+        assert_eq!(keys, vec!["id", "v", "extra"]);
+        assert_eq!(
+            Value::Object(by_id["u2"].clone()),
+            json!({"id": "u2", "v": 2})
+        );
+
+        // 已保存版本永不变：v1 中 u1 仍是旧记录。
+        let old = store.read_records(v1.id, "users").unwrap();
+        assert_eq!(
+            Value::Object(old.into_iter().find(|r| r["id"] == "u1").unwrap()),
+            json!({"id": "u1", "v": 1})
+        );
+
+        // 之后的版本差异：u1 在 changed 中，before 旧、after 新。
+        let d = store.diff_versions(v1.id, v2.id, "users").unwrap();
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(
+            d.changed[0].before,
+            json!({"id": "u1", "v": 1}).as_object().unwrap().clone()
+        );
+        assert_eq!(
+            d.changed[0].after,
+            json!({"id": "u1", "v": 10, "extra": "x"})
+                .as_object()
+                .unwrap()
+                .clone()
+        );
+
+        // 内容完全相同的替换批次：幂等，replaced/inserted 均为 0。
+        let out = store
+            .write_batch("users", &[json!({"id": "u1", "v": 10, "extra": "x"})], true)
+            .unwrap();
+        assert_eq!(out.inserted, 0);
+        assert_eq!(out.replaced, 0);
+
+        // 字段顺序不同但内容相同：不算替换。
+        let out = store
+            .write_batch("users", &[json!({"extra": "x", "id": "u1", "v": 10})], true)
+            .unwrap();
+        assert_eq!(out.replaced, 0);
+
+        // 字段顺序不同且内容变化：算作替换，落库字段顺序按新记录。
+        let out = store
+            .write_batch("users", &[json!({"extra": "x", "id": "u1", "v": 11})], true)
+            .unwrap();
+        assert_eq!(out.replaced, 1);
+        let v3 = store.save_version().unwrap();
+        let recs = store.read_records(v3.id, "users").unwrap();
+        let u1 = recs.into_iter().find(|r| r["id"] == "u1").unwrap();
+        let keys: Vec<_> = u1.keys().cloned().collect();
+        assert_eq!(keys, vec!["extra", "id", "v"]);
+
+        // replace=false 的老规则仍生效：不同内容依旧拒绝。
+        let err = store
+            .write_batch("users", &[json!({"id": "u2", "v": 99})], false)
+            .unwrap_err();
+        assert!(matches!(err, BatchError::Rejected(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_batch_is_strictly_atomic() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch("users", &[json!({"id": "u1", "v": 1})], false)
+            .unwrap();
+
+        // 非法字段（浮点）：即使 u1 在同批中应被替换，整批也不得生效。
+        let err = store
+            .write_batch(
+                "users",
+                &[json!({"id": "u1", "v": 2}), json!({"id": "u9", "v": 1.5})],
+                true,
+            )
+            .unwrap_err();
+        match err {
+            BatchError::Rejected(r) => {
+                assert_eq!(r.index, 1);
+                assert_eq!(r.id.as_deref(), Some("u9"));
+            }
+            BatchError::Persist(e) => panic!("{e}"),
+        }
+
+        // 同批主键重复：replace=true 也整批拒绝。
+        let err = store
+            .write_batch(
+                "users",
+                &[json!({"id": "d", "v": 1}), json!({"id": "d", "v": 2})],
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(err, BatchError::Rejected(r) if r.reason.contains("duplicate id")));
+
+        // 记录不是 JSON 对象 / 缺主键：replace=true 同样拒绝。
+        assert!(matches!(
+            store.write_batch("users", &[json!(42)], true).unwrap_err(),
+            BatchError::Rejected(r) if r.reason.contains("JSON object")
+        ));
+        assert!(matches!(
+            store
+                .write_batch("users", &[json!({"v": 1})], true)
+                .unwrap_err(),
+            BatchError::Rejected(r) if r.reason.contains("missing primary key")
+        ));
+
+        // u1 内容未被部分替换。
+        let v = store.save_version().unwrap();
+        let recs = store.read_records(v.id, "users").unwrap();
+        assert_eq!(
+            Value::Object(recs.into_iter().next().unwrap()),
+            json!({"id": "u1", "v": 1})
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_survives_restart_and_keeps_old_versions() {
+        let dir = temp_dir();
+        let v1_id;
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .write_batch(
+                    "users",
+                    &[json!({"id": "u1", "v": 1}), json!({"id": "u2", "v": 2})],
+                    false,
+                )
+                .unwrap();
+            v1_id = store.save_version().unwrap().id;
+            // 保存版本之后再替换：历史版本不受影响。
+            store
+                .write_batch(
+                    "users",
+                    &[json!({"id": "u1", "v": 100}), json!({"id": "u3", "v": 3})],
+                    true,
+                )
+                .unwrap();
+
+            // 替换事件以 replace:true 落入 WAL。
+            let wal = fs::read_to_string(dir.join("wal.log")).unwrap();
+            assert!(wal.lines().any(|l| l.contains("\"replace\":true")));
+        }
+
+        // kill -9 式重开：已确认的替换与新增都恢复，已保存版本不变。
+        let store = Store::open(&dir).unwrap();
+        let old = store.read_records(v1_id, "users").unwrap();
+        assert_eq!(old.len(), 2);
+        assert_eq!(
+            Value::Object(old.into_iter().find(|r| r["id"] == "u1").unwrap()),
+            json!({"id": "u1", "v": 1})
+        );
+        let v2 = store.save_version().unwrap();
+        let recs = store.read_records(v2.id, "users").unwrap();
+        let by_id: std::collections::HashMap<_, _> = recs
+            .iter()
+            .map(|r| (r["id"].as_str().unwrap(), r))
+            .collect();
+        assert_eq!(by_id.len(), 3);
+        assert_eq!(
+            Value::Object(by_id["u1"].clone()),
+            json!({"id": "u1", "v": 100})
+        );
+        assert_eq!(
+            Value::Object(by_id["u3"].clone()),
+            json!({"id": "u3", "v": 3})
+        );
+
+        let d = store.diff_versions(v1_id, v2.id, "users").unwrap();
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.changed[0].before["v"], 1);
+        assert_eq!(d.changed[0].after["v"], 100);
+        let dropped: Vec<_> = d
+            .dropped
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(dropped, vec!["u3"]);
 
         fs::remove_dir_all(&dir).ok();
     }

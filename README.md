@@ -25,7 +25,7 @@ VDE_BIND=127.0.0.1:8080 VDE_DATA=./data cargo run --locked
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
-| `/collections/{集合名}/records` | POST | 提交一批记录，全有或全无；集合首次写入时自动创建 |
+| `/collections/{集合名}/records` | POST | 提交一批记录，全有或全无；`"replace":true` 时允许替换同主键记录；集合首次写入时自动创建 |
 | `/versions` | POST | 把当前各集合数据固化为只读版本，返回版本标识与保存时间 |
 | `/versions` | GET | 列出全部已保存版本 |
 | `/versions/{id}` | GET | 查询单个版本的详情（含集合名列表） |
@@ -66,6 +66,26 @@ curl -s -X POST http://127.0.0.1:8080/collections/users/records \
 ```
 
 与已有记录完全相同的写入是幂等的（返回 200，`inserted` 为 0）。
+
+### 替换已导入的记录
+
+请求体可选字段 `replace`（布尔值，默认 `false`，缺省时行为与上述完全一致）。设为
+`true` 时，允许用新内容覆盖同主键的已有记录：同主键不同内容不再整批拒绝，而是被替换；
+响应中 `replaced` 为被替换的记录条数，`inserted` 仍为新增条数，其余字段含义不变。
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/collections/users/records \
+  -H 'Content-Type: application/json' \
+  -d '{"replace":true,"records":[{"id":"u1","name":"Ada","age":37}]}'
+# {"collection":"users","accepted":1,"inserted":0,"replaced":1}
+```
+
+替换只影响当前数据：已保存版本永不改变，之后保存的版本与旧版本做差异比较时，被替换的
+记录出现在 `changed` 中（`before` 为旧记录、`after` 为新记录）。字段顺序按新记录的写入
+顺序保留，但比较内容时字段顺序不影响判定（顺序不同、内容相同仍为幂等，不计入
+`replaced`）。同一批内主键重复、记录非法、空批次等校验与 `replace=false` 完全一致，
+任一条不合法时整批不生效，不会发生部分替换。带替换的批次同样先追加到 WAL 并 fsync
+才确认成功，重启后已确认的替换与替换后的当前数据一致。
 
 ### 保存版本
 
@@ -160,4 +180,5 @@ cargo test
 
 覆盖：整批原子性与各类校验拒绝、快照只读与字段顺序、版本/集合不存在报错、
 版本差异（added/dropped/changed、排序、顺序与存在性错误）、
+同主键替换（replaced/inserted 计数、原子性、字段顺序、历史版本不变与重启恢复）、
 并发写入与快照的无半批一致性、重启恢复与残缺 WAL 截断。

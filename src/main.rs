@@ -59,6 +59,9 @@ impl IntoResponse for ApiError {
 #[derive(Deserialize)]
 struct WriteRequest {
     records: Vec<Value>,
+    /// 是否允许用新内容替换同主键的已有记录；缺省为 false，行为与不支持替换时一致。
+    #[serde(default)]
+    replace: bool,
 }
 
 /// `POST /collections/{collection}/records`：提交一批记录（全有或全无）。
@@ -74,12 +77,19 @@ async fn write_records(
             "records must be a non-empty array",
         ));
     }
-    match s.write_batch(&collection, &req.records) {
-        Ok(out) => Ok(Json(json!({
-            "collection": out.collection,
-            "accepted": out.accepted,
-            "inserted": out.inserted,
-        }))),
+    match s.write_batch(&collection, &req.records, req.replace) {
+        Ok(out) => {
+            // replace=false（或缺省）时响应与原来完全一致；仅替换模式附加 "replaced"。
+            let mut body = json!({
+                "collection": out.collection,
+                "accepted": out.accepted,
+                "inserted": out.inserted,
+            });
+            if req.replace {
+                body["replaced"] = json!(out.replaced);
+            }
+            Ok(Json(body))
+        }
         Err(BatchError::Rejected(r)) => Err(ApiError {
             status: StatusCode::BAD_REQUEST,
             body: json!({
