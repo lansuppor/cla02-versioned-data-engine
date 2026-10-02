@@ -5,13 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use serde_json::{Value, json};
-use std::{env, error::Error, sync::Arc};
+use std::{cell::RefCell, env, error::Error, fmt, rc::Rc, sync::Arc};
 
 mod store;
 
-use store::{BatchError, DiffError, LookupError, Store};
+use store::{BatchError, CondObject, CondValue, DiffError, LookupError, Store};
 
 #[derive(Serialize)]
 struct Health {
@@ -196,6 +196,170 @@ async fn read_records(
     })))
 }
 
+/// 查询请求体的自定义解析种子：逐层构建条件树。
+///
+/// serde_json 反序列化到 `Map` 时会静默覆盖重复键，无法事后检测，因此这里用
+/// 自定义 Visitor 在解析过程中发现同一条件对象内的重复字段名并拒绝整个请求。
+struct CondValueSeed {
+    /// 当前值在条件树中的完整字段路径（顶层为空），用于重复字段的报错定位。
+    path: String,
+    /// 发现重复字段时写入其完整路径，供解析失败后构造结构化错误响应。
+    dup: Rc<RefCell<Option<String>>>,
+}
+
+impl<'de> de::DeserializeSeed<'de> for CondValueSeed {
+    type Value = CondValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<CondValue, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> de::Visitor<'de> for CondValueSeed {
+    type Value = CondValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a query condition value")
+    }
+
+    /// 嵌套对象表示子条件：逐键解析，同一对象内字段名重复即报错。
+    fn visit_map<A>(self, mut map: A) -> Result<CondValue, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let child_path = if self.path.is_empty() {
+                key.clone()
+            } else {
+                format!("{}.{}", self.path, key)
+            };
+            if !seen.insert(key.clone()) {
+                *self.dup.borrow_mut() = Some(child_path.clone());
+                return Err(de::Error::custom(format!(
+                    "duplicate field \"{child_path}\" in query conditions"
+                )));
+            }
+            let value = map.next_value_seed(CondValueSeed {
+                path: child_path,
+                dup: self.dup.clone(),
+            })?;
+            entries.push((key, value));
+        }
+        Ok(CondValue::Sub(CondObject(entries)))
+    }
+
+    // 标量期望值：字符串、整数、布尔、null。浮点数与数组在记录中不允许出现，
+    // 作为期望值时按完全相等处理（必然不命中任何记录）。
+    fn visit_bool<E>(self, v: bool) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::Bool(v)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::from(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::from(v)))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<CondValue, E>
+    where
+        E: de::Error,
+    {
+        match serde_json::Number::from_f64(v) {
+            Some(n) => Ok(CondValue::Scalar(Value::Number(n))),
+            None => Err(E::custom("invalid number in query conditions")),
+        }
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::String(v.to_owned())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::String(v)))
+    }
+
+    fn visit_unit<E>(self) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<CondValue, E> {
+        Ok(CondValue::Scalar(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<CondValue, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element::<Value>()? {
+            items.push(item);
+        }
+        Ok(CondValue::Scalar(Value::Array(items)))
+    }
+}
+
+/// 解析查询请求体为条件树。空请求体按空条件（不筛选）处理；
+/// 同一条件对象内字段名重复时整批拒绝（400），并给出可识别的字段路径。
+fn parse_conditions(body: &str) -> Result<CondObject, ApiError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(CondObject::default());
+    }
+    let dup = Rc::new(RefCell::new(None));
+    let seed = CondValueSeed {
+        path: String::new(),
+        dup: dup.clone(),
+    };
+    let mut de = serde_json::Deserializer::from_str(trimmed);
+    let parsed = de::DeserializeSeed::deserialize(seed, &mut de).and_then(|v| de.end().map(|_| v));
+    match parsed {
+        Ok(CondValue::Sub(conditions)) => Ok(conditions),
+        Ok(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "query conditions must be a JSON object",
+        )),
+        Err(e) => {
+            if let Some(path) = dup.borrow_mut().take() {
+                Err(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    body: json!({
+                        "error": format!("duplicate field \"{path}\" in query conditions"),
+                        "field": path,
+                    }),
+                })
+            } else {
+                Err(ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))
+            }
+        }
+    }
+}
+
+/// `GET /versions/{id}/collections/{collection}/records/query`：
+/// 按条件筛选版本内集合的记录（只读，不生成新版本、不改变任何记录）。
+async fn query_records(
+    State(s): State<Arc<Store>>,
+    Path((version_id, collection)): Path<(u64, String)>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    let conditions = parse_conditions(&body)?;
+    let records = s
+        .query_records(version_id, &collection, &conditions)
+        .map_err(|e| lookup_error(e, &collection, version_id))?;
+    Ok(Json(json!({
+        "version": version_id,
+        "collection": collection,
+        "records": records,
+    })))
+}
+
+
 /// `GET /versions/{from}/collections/{collection}/diff/{to}`：
 /// 比较同一集合在两个已保存版本之间的差异（只读，不生成新版本）。
 async fn diff_versions(
@@ -280,6 +444,10 @@ fn app(store: Arc<Store>) -> Router {
         .route(
             "/versions/{id}/collections/{collection}/records",
             get(read_records),
+        )
+        .route(
+            "/versions/{id}/collections/{collection}/records/query",
+            get(query_records),
         )
         .route(
             "/versions/{from}/collections/{collection}/diff/{to}",

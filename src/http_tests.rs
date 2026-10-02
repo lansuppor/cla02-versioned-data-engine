@@ -421,6 +421,145 @@ async fn diff_versions_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_records_endpoint() {
+    let s = spawn_server().await;
+
+    // 初始数据：u3 的 age 是字符串，用于验证类型严格匹配。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(
+            r#"{"records":[{"id":"u1","name":"Ada","age":36,"active":true,"meta":{"role":"admin","score":10}},{"id":"u2","name":"Lin","age":28,"active":false,"meta":null},{"id":"u3","name":"Ada","age":"36","meta":{"role":"user"}}]}"#,
+        ),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v1 = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    // 保存版本后再写入一条：查询应只针对 v1 快照。
+    request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u4","name":"Late","age":36}]}"#),
+    );
+
+    let query = |body: Option<&str>| {
+        request(
+            &s.addr,
+            "GET",
+            &format!("/versions/{v1}/collections/users/records/query"),
+            body,
+        )
+    };
+    let ids = |r: &RawResponse| {
+        r.body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rec| rec["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // 标量完全相等，类型不同不命中：age 36 只命中 u1，"36" 只命中 u3。
+    let r = query(Some(r#"{"age":36}"#));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["version"], v1);
+    assert_eq!(r.body["collection"], "users");
+    assert_eq!(ids(&r), vec!["u1"]);
+    let r = query(Some(r#"{"age":"36"}"#));
+    assert_eq!(ids(&r), vec!["u3"]);
+
+    // 组合条件与点路径：name=Ada 且 meta.role=admin。
+    let r = query(Some(r#"{"name":"Ada","meta.role":"admin"}"#));
+    assert_eq!(ids(&r), vec!["u1"]);
+
+    // 嵌套子条件写法，与点路径等价；记录字段是 null 时不命中子条件。
+    let r = query(Some(r#"{"meta":{"role":"admin"}}"#));
+    assert_eq!(ids(&r), vec!["u1"]);
+
+    // 布尔与 null 期望值。
+    let r = query(Some(r#"{"active":false}"#));
+    assert_eq!(ids(&r), vec!["u2"]);
+    let r = query(Some(r#"{"meta":null}"#));
+    assert_eq!(ids(&r), vec!["u2"]);
+
+    // 路径中间层缺失或不是对象：不命中，不报错。
+    let r = query(Some(r#"{"meta.role.deep":1}"#));
+    assert_eq!(r.status, 200);
+    assert_eq!(ids(&r).len(), 0);
+
+    // 空条件对象：不筛选，返回 v1 全部记录（u4 不在 v1 中），字段顺序保持写入顺序。
+    let r = query(Some(r"{}"));
+    assert_eq!(r.status, 200);
+    assert_eq!(ids(&r), vec!["u1", "u2", "u3"]);
+    let keys: Vec<_> = r.body["records"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, vec!["id", "name", "age", "active", "meta"]);
+
+    // 空请求体同样按不筛选处理。
+    let r = query(None);
+    assert_eq!(r.status, 200);
+    assert_eq!(ids(&r), vec!["u1", "u2", "u3"]);
+
+    // 同一条件对象内字段名重复：整批拒绝，给出 error 与字段路径，无 id。
+    let r = query(Some(r#"{"name":"Ada","name":"Lin"}"#));
+    assert_eq!(r.status, 400);
+    assert!(
+        r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate field \"name\"")
+    );
+    assert_eq!(r.body["field"], "name");
+    assert!(r.body.get("id").is_none());
+
+    // 嵌套子条件内的重复字段：报完整字段路径。
+    let r = query(Some(r#"{"meta":{"role":"admin","role":"user"}}"#));
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["field"], "meta.role");
+    assert!(
+        r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate field \"meta.role\"")
+    );
+
+    // 请求体不是 JSON 对象 / 非法 JSON：400。
+    let r = query(Some("42"));
+    assert_eq!(r.status, 400);
+    let r = query(Some("{not json"));
+    assert_eq!(r.status, 400);
+
+    // 版本 / 集合不存在：404，与既有版本查询一致。
+    let r = request(
+        &s.addr,
+        "GET",
+        "/versions/999/collections/users/records/query",
+        Some(r"{}"),
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body["error"].as_str().unwrap().contains("version 999"));
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/orders/records/query"),
+        Some(r"{}"),
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body["error"].as_str().unwrap().contains("orders"));
+
+    // 查询是只读操作：不生成新版本。
+    let r = request(&s.addr, "GET", "/versions", None);
+    assert_eq!(r.body["versions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_versions_survive_restart() {
     let dir = tempfile::TempDir::new();
     let v1;

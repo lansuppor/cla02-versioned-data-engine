@@ -43,6 +43,19 @@ pub enum LookupError {
     CollectionNotFound,
 }
 
+/// 查询条件中的一个期望值：标量（与记录值完全相等才命中）或子条件对象
+/// （要求记录对应字段为对象，且逐项满足子条件）。
+#[derive(Debug, Clone)]
+pub enum CondValue {
+    Scalar(Value),
+    Sub(CondObject),
+}
+
+/// 一个条件对象：有序的（字段路径, 期望值）列表；字段路径以点连接嵌套字段名，
+/// 如 "meta.role"。解析阶段已保证同一条件对象内字段名不重复。
+#[derive(Debug, Clone, Default)]
+pub struct CondObject(pub Vec<(String, CondValue)>);
+
 /// 版本差异查询失败：版本/集合不存在（404）或起始版本晚于目标版本（400）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffError {
@@ -546,6 +559,32 @@ impl Store {
             .ok_or(LookupError::CollectionNotFound)
     }
 
+    /// 按条件筛选指定版本内指定集合的记录（只读：不生成新版本、不改变任何数据）。
+    ///
+    /// 条件为空时返回全部记录；结果顺序与字段顺序均与 `read_records` 一致。
+    pub fn query_records(
+        &self,
+        version_id: u64,
+        collection: &str,
+        conditions: &CondObject,
+    ) -> Result<Vec<Record>, LookupError> {
+        let st = self.inner.lock().unwrap();
+        let version = st
+            .versions
+            .iter()
+            .find(|v| v.id == version_id)
+            .ok_or(LookupError::VersionNotFound)?;
+        let records = version
+            .data
+            .get(collection)
+            .ok_or(LookupError::CollectionNotFound)?;
+        Ok(records
+            .iter()
+            .filter(|r| record_matches(r, conditions))
+            .cloned()
+            .collect())
+    }
+
     /// 比较同一集合在两个已保存版本之间的差异。
     ///
     /// 只读取快照，不生成新版本、不改写任何数据。记录内容比较与写入冲突检测一致：
@@ -758,6 +797,35 @@ fn truncate_wal(wal: &mut fs::File, wal_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 按点分字段路径在对象中逐层查找；任一层缺失或不是对象时返回 None（不报错）。
+fn lookup_path<'a>(obj: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segments = path.split('.');
+    let mut value = obj.get(segments.next()?)?;
+    for seg in segments {
+        value = value.as_object()?.get(seg)?;
+    }
+    Some(value)
+}
+
+/// 记录是否满足全部条件（条件字段顺序不影响判定，与记录比较规则一致）：
+/// 标量期望值要求类型与值完全相等（如期望 36 不命中 "36"）；
+/// 子条件对象要求对应字段为对象且逐项满足，嵌套层数不限。
+fn record_matches(record: &Record, conditions: &CondObject) -> bool {
+    conditions.0.iter().all(|(path, expected)| {
+        let Some(target) = lookup_path(record, path) else {
+            return false;
+        };
+        match expected {
+            CondValue::Scalar(want) => target == want,
+            CondValue::Sub(sub) => match target {
+                Value::Object(obj) => record_matches(obj, sub),
+                _ => false,
+            },
+        }
+    })
+}
+
+
 /// 递归校验字段值：仅允许字符串、整数、布尔、null 与嵌套对象；
 /// 浮点数与数组一律拒绝。
 fn validate_value(v: &Value) -> Result<(), String> {
@@ -913,6 +981,137 @@ mod unit_tests {
             store.read_records(v1.id, "missing"),
             Err(LookupError::CollectionNotFound)
         ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn query_records_filters_by_conditions() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch(
+                "users",
+                &[
+                    json!({"id": "u1", "name": "Ada", "age": 36, "active": true,
+                           "meta": {"role": "admin", "tags": {"level": 2}}}),
+                    json!({"id": "u2", "name": "Lin", "age": 28, "active": false, "meta": null}),
+                    json!({"id": "u3", "name": "Ada", "age": "36", "meta": {"role": "user"}}),
+                ],
+                false,
+            )
+            .unwrap();
+        let v = store.save_version().unwrap();
+
+        let cond = |pairs: Vec<(&str, CondValue)>| {
+            CondObject(pairs.into_iter().map(|(k, e)| (k.to_string(), e)).collect())
+        };
+        let scalar = |v: Value| CondValue::Scalar(v);
+
+        // 标量完全相等；类型不同不命中（期望 36 不命中 u3 的 "36"）。
+        let out = store
+            .query_records(v.id, "users", &cond(vec![("age", scalar(json!(36)))]))
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u1"]);
+        let out = store
+            .query_records(v.id, "users", &cond(vec![("age", scalar(json!("36")))]))
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u3"]);
+
+        // 组合条件：全部满足才命中。
+        let out = store
+            .query_records(
+                v.id,
+                "users",
+                &cond(vec![
+                    ("name", scalar(json!("Ada"))),
+                    ("meta.role", scalar(json!("admin"))),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u1"]);
+
+        // 点路径与嵌套子条件写法等价。
+        let nested = store
+            .query_records(
+                v.id,
+                "users",
+                &cond(vec![(
+                    "meta",
+                    CondValue::Sub(cond(vec![("role", scalar(json!("admin")))])),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(ids_of(&nested), vec!["u1"]);
+
+        // 多层嵌套子条件。
+        let deep = store
+            .query_records(
+                v.id,
+                "users",
+                &cond(vec![(
+                    "meta",
+                    CondValue::Sub(cond(vec![(
+                        "tags",
+                        CondValue::Sub(cond(vec![("level", scalar(json!(2)))])),
+                    )])),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(ids_of(&deep), vec!["u1"]);
+
+        // 路径中间层缺失或不是对象（u2 的 meta 为 null）：不命中，不报错。
+        let out = store
+            .query_records(
+                v.id,
+                "users",
+                &cond(vec![("meta.role.x", scalar(json!(1)))]),
+            )
+            .unwrap();
+        assert!(out.is_empty());
+
+        // 子条件要求对应字段为对象：空子条件命中任意对象，但不命中 null。
+        let out = store
+            .query_records(
+                v.id,
+                "users",
+                &cond(vec![("meta", CondValue::Sub(cond(vec![])))]),
+            )
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u1", "u3"]);
+
+        // 布尔与 null 期望值。
+        let out = store
+            .query_records(v.id, "users", &cond(vec![("active", scalar(json!(true)))]))
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u1"]);
+        let out = store
+            .query_records(v.id, "users", &cond(vec![("meta", scalar(json!(null)))]))
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u2"]);
+
+        // 空条件：不筛选，返回全部记录且保持写入顺序。
+        let out = store
+            .query_records(v.id, "users", &CondObject::default())
+            .unwrap();
+        assert_eq!(ids_of(&out), vec!["u1", "u2", "u3"]);
+
+        // 只读：不生成新版本。
+        assert_eq!(store.list_versions().len(), 1);
+
+        // 版本/集合不存在。
+        assert_eq!(
+            store
+                .query_records(999, "users", &CondObject::default())
+                .unwrap_err(),
+            LookupError::VersionNotFound
+        );
+        assert_eq!(
+            store
+                .query_records(v.id, "missing", &CondObject::default())
+                .unwrap_err(),
+            LookupError::CollectionNotFound
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
