@@ -793,3 +793,423 @@ async fn concurrent_writes_and_snapshots_never_see_half_batches() {
         writers * batches * batch_size
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_records_endpoint() {
+    let s = spawn_server().await;
+
+    // 初始数据。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(
+            r#"{"records":[{"id":"u1","name":"Ada"},{"id":"u2","name":"Lin"},{"id":"u3","name":"Zed"}]}"#,
+        ),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v1 = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+
+    // 删除：u1、u3 存在，ghost 不存在。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"delete":["u1","u3","ghost"]}"#),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["collection"], "users");
+    assert_eq!(r.body["accepted"], 3);
+    assert_eq!(r.body["deleted"], 2);
+    assert_eq!(r.body["missing"], 1);
+    // 删除响应不含写入字段。
+    assert!(r.body.get("inserted").is_none());
+    assert!(r.body.get("replaced").is_none());
+
+    // 重复删除：全部 missing、deleted 为 0，仍然 200。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"delete":["u1","u3","ghost"]}"#),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["deleted"], 0);
+    assert_eq!(r.body["missing"], 3);
+
+    // 当前数据只剩 u2。
+    let v2 = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let ids: Vec<_> = r.body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["u2"]);
+
+    // 已保存版本 v1 不变；v1 → v2 的差异中 u1/u3 出现在 added（按字节序）。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.body["records"].as_array().unwrap().len(), 3);
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let added: Vec<_> = r.body["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(added, vec!["u1", "u3"]);
+    assert_eq!(r.body["dropped"].as_array().unwrap().len(), 0);
+    assert_eq!(r.body["changed"].as_array().unwrap().len(), 0);
+
+    // 删除后写回同主键同内容：算新增插入。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u1","name":"Ada"}]}"#),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["inserted"], 1);
+
+    // 对尚不存在的集合删除：全部 missing，集合不被创建。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/orders/records",
+        Some(r#"{"delete":["o1","o2"]}"#),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["deleted"], 0);
+    assert_eq!(r.body["missing"], 2);
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/orders/records"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_request_validation_rejects_whole_batch() {
+    let s = spawn_server().await;
+    request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u1"},{"id":"u2"},{"id":"u3"}]}"#),
+    );
+
+    // 空数组：400。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"delete":[]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert!(r.body["error"].as_str().unwrap().contains("non-empty"));
+
+    // 非字符串元素：400，带 index；数字、布尔、null、对象各试一次。
+    for (i, bad) in [
+        r#"{"delete":[42]}"#,
+        r#"{"delete":[true]}"#,
+        r#"{"delete":[null]}"#,
+        r#"{"delete":[{"id":"u1"}]}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let r = request(&s.addr, "POST", "/collections/users/records", Some(bad));
+        assert_eq!(r.status, 400, "case {i}: {}", r.body);
+        assert_eq!(r.body["index"], 0);
+        assert!(r.body["error"].as_str().unwrap().contains("string"));
+        assert!(r.body["id"].is_null());
+    }
+
+    // 空字符串元素：400。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"delete":["u1",""]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 1);
+
+    // 同批重复主键：400，给出 index 与 id。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"delete":["u1","u2","u1"]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 2);
+    assert_eq!(r.body["id"], "u1");
+    assert!(r.body["error"].as_str().unwrap().contains("duplicate"));
+
+    // records 与 delete 同时出现：400，整批无效。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u9"}],"delete":["u2"]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert!(r.body["error"].as_str().unwrap().contains("delete"));
+
+    // 所有拒绝都未产生效果：u1/u2/u3 原样，u9 未写入。
+    let v = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v}/collections/users/records"),
+        None,
+    );
+    let ids: Vec<_> = r.body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["u1", "u2", "u3"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_survives_restart_over_http() {
+    let dir = tempfile::TempDir::new();
+    let v1;
+    {
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app(store)).await.unwrap();
+        });
+        request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"records":[{"id":"u1","v":1},{"id":"u2","v":2}]}"#),
+        );
+        v1 = request(&addr, "POST", "/versions", None).body["id"]
+            .as_u64()
+            .unwrap();
+        // 已确认删除：WAL 追加并 fsync 后才返回 200。
+        let r = request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"delete":["u1","nope"]}"#),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body["deleted"], 1);
+        assert_eq!(r.body["missing"], 1);
+    }
+
+    // 同一数据目录重启。
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app(store)).await.unwrap();
+    });
+
+    // 历史版本仍是两条旧记录。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.body["records"].as_array().unwrap().len(), 2);
+
+    // 当前数据与删除后一致：只剩 u2。
+    let v2 = request(&addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let ids: Vec<_> = r.body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["u2"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_deletes_writes_and_snapshots_never_see_half_batches() {
+    let s = Arc::new(spawn_server().await);
+
+    // 预置 200 条记录，供后续删除。
+    let mut all_ids = Vec::new();
+    for start in (0..200).step_by(20) {
+        let mut recs = String::from("[");
+        for i in 0..20 {
+            if i > 0 {
+                recs.push(',');
+            }
+            let id = format!("d{:03}", start + i);
+            all_ids.push(id.clone());
+            recs.push_str(&format!("{{\"id\":\"{id}\"}}"));
+        }
+        recs.push(']');
+        let r = request(
+            &s.addr,
+            "POST",
+            "/collections/items/records",
+            Some(&format!(r#"{{"records":{recs}}}"#)),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    // 4 个删除线程：每个负责 25 个互不相交的 id，分 5 批每批 5 个；
+    // 另有 4 个写入线程持续写入带 w 标记的新记录。
+    let mut handles = Vec::new();
+    for w in 0..4usize {
+        let addr = s.addr.clone();
+        let ids: Vec<String> = all_ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 4 == w)
+            .map(|(_, id)| id.clone())
+            .collect();
+        handles.push(tokio::spawn(async move {
+            for chunk in ids.chunks(5) {
+                let arr = chunk
+                    .iter()
+                    .map(|id| format!("\"{id}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let payload = format!(r#"{{"delete":[{arr}]}}"#);
+                let addr2 = addr.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    request(&addr2, "POST", "/collections/items/records", Some(&payload))
+                })
+                .await
+                .unwrap();
+                assert_eq!(r.status, 200, "{}", r.body);
+                assert_eq!(r.body["deleted"].as_u64().unwrap(), chunk.len() as u64);
+                assert_eq!(r.body["missing"].as_u64().unwrap(), 0);
+            }
+        }));
+    }
+    for w in 0..4usize {
+        let addr = s.addr.clone();
+        handles.push(tokio::spawn(async move {
+            for b in 0..10 {
+                let payload = format!(r#"{{"records":[{{"id":"n{w}-{b}","w":{w},"b":{b}}}]}}"#);
+                let addr2 = addr.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    request(&addr2, "POST", "/collections/items/records", Some(&payload))
+                })
+                .await
+                .unwrap();
+                assert_eq!(r.status, 200, "{}", r.body);
+            }
+        }));
+    }
+    // 并发保存快照。
+    let saver_addr = s.addr.clone();
+    let saver = tokio::spawn(async move {
+        let mut saved = Vec::new();
+        for _ in 0..20 {
+            let addr2 = saver_addr.clone();
+            let r = tokio::task::spawn_blocking(move || request(&addr2, "POST", "/versions", None))
+                .await
+                .unwrap();
+            assert_eq!(r.status, 201);
+            saved.push(r.body["id"].as_u64().unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        saved
+    });
+
+    for h in handles {
+        h.await.unwrap();
+    }
+    let saved = saver.await.unwrap();
+
+    // 任一快照中：预置记录的删除要么整批（5 条一组）可见、要么整组仍在，
+    // 不会出现半批删除；写入批次同理（按 w/b 计数只能为 0 或 1）。
+    for vid in saved {
+        let addr = s.addr.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            request(
+                &addr,
+                "GET",
+                &format!("/versions/{vid}/collections/items/records"),
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.status, 200);
+        let present: std::collections::HashSet<String> = r.body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rec| rec["id"].as_str().unwrap().starts_with('d'))
+            .map(|rec| rec["id"].as_str().unwrap().to_string())
+            .collect();
+        // 删除批次的真实形状：writer w 的第 b 批为全局下标 w+4*(5b+k)（k=0..5）。
+        for w in 0..4usize {
+            for b in 0..10usize {
+                let group: Vec<&String> = (0..5).map(|k| &all_ids[w + 4 * (5 * b + k)]).collect();
+                let n = group.iter().filter(|id| present.contains(**id)).count();
+                assert!(
+                    n == 0 || n == group.len(),
+                    "half-deleted batch w{w} b{b}: {n}/{}",
+                    group.len()
+                );
+            }
+        }
+    }
+
+    // 最终：预置的 200 条全部删除，40 条新写入全部可见。
+    let final_v = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{final_v}/collections/items/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 40);
+    assert!(
+        recs.iter()
+            .all(|rec| rec["id"].as_str().unwrap().starts_with('n'))
+    );
+}
