@@ -298,7 +298,9 @@ async fn diff_versions_endpoint() {
         &s.addr,
         "POST",
         "/collections/users/records",
-        Some(r#"{"records":[{"id":"u1","name":"Ada","age":36},{"id":"u2","name":"Lin","age":28}]}"#),
+        Some(
+            r#"{"records":[{"id":"u1","name":"Ada","age":36},{"id":"u2","name":"Lin","age":28}]}"#,
+        ),
     );
     assert_eq!(r.status, 200);
     let r = request(&s.addr, "POST", "/versions", None);
@@ -475,6 +477,254 @@ async fn persisted_versions_survive_restart() {
     assert_eq!(r.body["records"].as_array().unwrap().len(), 2);
     let r = request(&addr, "GET", "/versions", None);
     assert_eq!(r.body["versions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_batch_overwrites_and_keeps_versions() {
+    let s = spawn_server().await;
+
+    // 初始写入。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(
+            r#"{"records":[{"id":"u1","name":"Ada","age":36},{"id":"u2","name":"Lin","age":28}]}"#,
+        ),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["inserted"], 2);
+    assert_eq!(r.body["replaced"], 0);
+
+    // 缺省 replace（字段缺省）时旧行为不变：同主键不同内容仍 400。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u1","name":"Ada","age":37}]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert!(
+        r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("different record")
+    );
+
+    // 显式 replace=false 同样拒绝。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u1","name":"Ada","age":37}],"replace":false}"#),
+    );
+    assert_eq!(r.status, 400);
+
+    // 保存版本 1，之后替换不应影响历史版本。
+    let r = request(&s.addr, "POST", "/versions", None);
+    assert_eq!(r.status, 201);
+    let v1 = r.body["id"].as_u64().unwrap();
+
+    // replace=true：1 条覆盖、1 条幂等（内容相同）、1 条新增。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(
+            r#"{"replace":true,"records":[
+              {"id":"u1","name":"Ada","age":37},
+              {"id":"u2","name":"Lin","age":28},
+              {"id":"u3","name":"New","age":20}
+            ]}"#,
+        ),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["accepted"], 3);
+    assert_eq!(r.body["inserted"], 1);
+    assert_eq!(r.body["replaced"], 1);
+
+    // 字段顺序不同但内容相同：幂等，replaced=0。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"replace":true,"records":[{"age":37,"id":"u1","name":"Ada"}]}"#),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["inserted"], 0);
+    assert_eq!(r.body["replaced"], 0);
+
+    // 保存版本 2：v1 仍旧，v1→v2 差异中 u1 出现在 changed。
+    let r = request(&s.addr, "POST", "/versions", None);
+    let v2 = r.body["id"].as_u64().unwrap();
+
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0], json!({"id":"u1","name":"Ada","age":36}));
+
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let changed = r.body["changed"].as_array().unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["id"], "u1");
+    assert_eq!(
+        changed[0]["before"],
+        json!({"id":"u1","name":"Ada","age":36})
+    );
+    assert_eq!(
+        changed[0]["after"],
+        json!({"id":"u1","name":"Ada","age":37})
+    );
+    let dropped: Vec<_> = r.body["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(dropped, vec!["u3"]);
+
+    // 当前数据（v2）字段顺序按新记录保留。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    let u1 = recs.iter().find(|r| r["id"] == "u1").unwrap();
+    // 最后一次写入 u1 的字段顺序为 age,id,name；内容比较与顺序无关（幂等），
+    // 但字段顺序按最近一次写入保留。
+    let keys: Vec<_> = u1.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, vec!["age", "id", "name"]);
+    assert_eq!(u1["age"], 37);
+    assert_eq!(recs.len(), 3);
+
+    // replace=true 仍整批拒绝：同批主键重复。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"replace":true,"records":[{"id":"d","v":1},{"id":"d","v":2}]}"#),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 1);
+    assert_eq!(r.body["id"], "d");
+    assert!(r.body["error"].as_str().unwrap().contains("duplicate"));
+
+    // replace=true 仍整批拒绝：非法字段（浮点），排在前面的 u1 不得被部分替换。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(
+            r#"{"replace":true,"records":[{"id":"u1","name":"Ada","age":99},{"id":"x","score":1.5}]}"#,
+        ),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 1);
+    assert_eq!(r.body["id"], "x");
+    assert!(r.body["error"].as_str().unwrap().contains("integer"));
+
+    // 数组字段、非对象、缺主键也都 400。
+    for body in [
+        r#"{"replace":true,"records":[{"id":"y","tags":["a"]}]}"#,
+        r#"{"replace":true,"records":[[1,2]]}"#,
+        r#"{"replace":true,"records":[{"name":"no-id"}]}"#,
+        r#"{"replace":true,"records":[]}"#,
+    ] {
+        let r = request(&s.addr, "POST", "/collections/users/records", Some(body));
+        assert_eq!(r.status, 400, "body={body}");
+    }
+
+    // 拒绝后数据不变：u1 仍是 age=37，没有 d/x/y 等残留。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 3);
+    let u1 = recs.iter().find(|r| r["id"] == "u1").unwrap();
+    assert_eq!(u1["age"], 37);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_replacements_survive_restart() {
+    let dir = tempfile::TempDir::new();
+    let v1;
+    {
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app(store)).await.unwrap();
+        });
+        let r = request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"records":[{"id":"u1","v":1}]}"#),
+        );
+        assert_eq!(r.status, 200);
+        let r = request(&addr, "POST", "/versions", None);
+        v1 = r.body["id"].as_u64().unwrap();
+        let r = request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"replace":true,"records":[{"id":"u1","v":2},{"id":"u2","v":9}]}"#),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body["replaced"], 1);
+        assert_eq!(r.body["inserted"], 1);
+    }
+
+    // 同目录重启：已确认替换恢复，已保存版本不变。
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app(store)).await.unwrap();
+    });
+
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["records"][0]["v"], 1);
+
+    let r = request(&addr, "POST", "/versions", None);
+    let v2 = r.body["id"].as_u64().unwrap();
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2);
+    let get = |id: &str| {
+        recs.iter().find(|r| r["id"] == id).unwrap()["v"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(get("u1"), 2);
+    assert_eq!(get("u2"), 9);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

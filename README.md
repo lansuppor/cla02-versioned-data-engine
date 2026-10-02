@@ -46,7 +46,7 @@ curl -s -X POST http://127.0.0.1:8080/collections/users/records \
       {"id": "u2", "name": "Lin", "age": 28, "active": false, "meta": null}
     ]
   }'
-# {"collection":"users","accepted":2,"inserted":2}
+# {"collection":"users","accepted":2,"inserted":2,"replaced":0}
 ```
 
 整批要么全部生效、要么全部不生效。出现以下任一情况时整批拒绝（HTTP 400），并指出是
@@ -55,7 +55,7 @@ curl -s -X POST http://127.0.0.1:8080/collections/users/records \
 - 记录不是 JSON 对象，或缺失/非法的字符串主键 `id`；
 - 同一批内主键重复；
 - 字段类型不合规（浮点数、数组等）；
-- 集合中已存在同一主键但内容不同的记录。
+- 集合中已存在同一主键但内容不同的记录（仅 `replace` 缺省或为 `false` 时）。
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/collections/users/records \
@@ -66,6 +66,26 @@ curl -s -X POST http://127.0.0.1:8080/collections/users/records \
 ```
 
 与已有记录完全相同的写入是幂等的（返回 200，`inserted` 为 0）。
+
+### 替换已有记录（`replace`）
+
+请求体可选字段 `replace`（布尔，默认 `false`，缺省时行为与上文完全一致）。
+`replace=true` 时，同主键但内容不同的已有记录不再导致整批拒绝，而是被新内容覆盖；
+响应中 `inserted` 仍为新增条数，`replaced` 为被覆盖条数（完全相同的写入幂等，
+两者都不计），其余字段不变。
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/collections/users/records \
+  -H 'Content-Type: application/json' \
+  -d '{"replace":true,"records":[{"id":"u1","name":"Ada","age":37}]}'
+# {"collection":"users","accepted":1,"inserted":0,"replaced":1}
+```
+
+替换同样是全有或全无：同批主键重复、非法记录等仍整批拒绝（HTTP 400），不会部分替换；
+字段顺序按新记录保留，但比较内容时字段顺序不影响判定。替换只改变当前数据，已保存版本
+永不变：保存版本后再替换同主键记录，历史版本查询仍返回旧记录，之后的版本差异中
+该记录出现在 `changed`（`before` 旧、`after` 新）。替换批次同样先追加 WAL 并 fsync
+才确认，崩溃恢复语义与普通写入一致。
 
 ### 保存版本
 
@@ -160,4 +180,5 @@ cargo test
 
 覆盖：整批原子性与各类校验拒绝、快照只读与字段顺序、版本/集合不存在报错、
 版本差异（added/dropped/changed、排序、顺序与存在性错误）、
+替换批次（覆盖计数、整批拒绝、历史版本不变、重启恢复）、
 并发写入与快照的无半批一致性、重启恢复与残缺 WAL 截断。
