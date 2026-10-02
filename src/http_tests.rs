@@ -290,6 +290,135 @@ async fn write_save_and_query_versioned_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_versions_endpoint() {
+    let s = spawn_server().await;
+
+    // v1：两个用户。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u1","name":"Ada","age":36},{"id":"u2","name":"Lin","age":28}]}"#),
+    );
+    assert_eq!(r.status, 200);
+    let r = request(&s.addr, "POST", "/versions", None);
+    let v1 = r.body["id"].as_u64().unwrap();
+
+    // v2：新增 u3（同主键不同内容会被写入接口拒绝，故 dropped 是唯一可经接口产生的变化）。
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/users/records",
+        Some(r#"{"records":[{"id":"u3","name":"New","age":20}]}"#),
+    );
+    assert_eq!(r.status, 200);
+    let r = request(
+        &s.addr,
+        "POST",
+        "/collections/orders/records",
+        Some(r#"{"records":[{"id":"o1","total":5}]}"#),
+    );
+    assert_eq!(r.status, 200);
+    let r = request(&s.addr, "POST", "/versions", None);
+    let v2 = r.body["id"].as_u64().unwrap();
+
+    // v1 → v2：u3 出现在 dropped，added/changed 为空。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["from"], v1);
+    assert_eq!(r.body["to"], v2);
+    assert_eq!(r.body["collection"], "users");
+    assert_eq!(r.body["added"].as_array().unwrap().len(), 0);
+    assert_eq!(r.body["changed"].as_array().unwrap().len(), 0);
+    let dropped = r.body["dropped"].as_array().unwrap();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0]["id"], "u3");
+
+    // 起始与目标相同 → 三个列表都为空。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["added"].as_array().unwrap().len(), 0);
+    assert_eq!(r.body["dropped"].as_array().unwrap().len(), 0);
+    assert_eq!(r.body["changed"].as_array().unwrap().len(), 0);
+
+    // 起始版本晚于目标版本 → 400。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 400);
+    assert!(r.body["error"].as_str().unwrap().contains("later"));
+
+    // 版本不存在 → 404。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/999/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body["error"].as_str().unwrap().contains("version 999"));
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/999"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body["error"].as_str().unwrap().contains("version 999"));
+
+    // 集合在起始版本中不存在 → 404。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/orders/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert!(
+        r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("version {v1}"))
+    );
+
+    // 顺序检查优先于集合检查：v2 → v1 即使集合缺失也先报 400。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/orders/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 400);
+
+    // 集合在起始与目标版本中都不存在 → 404。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/orders/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert!(r.body["error"].as_str().unwrap().contains("orders"));
+
+    // 差异查询不生成新版本。
+    let r = request(&s.addr, "GET", "/versions", None);
+    assert_eq!(r.body["versions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_versions_survive_restart() {
     let dir = tempfile::TempDir::new();
     let v1;
