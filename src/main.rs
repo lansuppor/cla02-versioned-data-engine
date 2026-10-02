@@ -1,6 +1,17 @@
-use axum::{Json, Router, routing::get};
-use serde::Serialize;
-use std::{env, error::Error};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{env, error::Error, sync::Arc};
+
+mod store;
+
+use store::{BatchError, LookupError, Store};
 
 #[derive(Serialize)]
 struct Health {
@@ -24,19 +35,170 @@ async fn version() -> Json<Version> {
     })
 }
 
+/// 统一错误响应：`{"error": "...", 可选的定位字段}`，不改变任何已有数据。
+struct ApiError {
+    status: StatusCode,
+    body: Value,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        ApiError {
+            status,
+            body: json!({ "error": message.into() }),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct WriteRequest {
+    records: Vec<Value>,
+}
+
+/// `POST /collections/{collection}/records`：提交一批记录（全有或全无）。
+async fn write_records(
+    State(s): State<Arc<Store>>,
+    Path(collection): Path<String>,
+    payload: Result<Json<WriteRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(req) = payload.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    if req.records.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "records must be a non-empty array",
+        ));
+    }
+    match s.write_batch(&collection, &req.records) {
+        Ok(out) => Ok(Json(json!({
+            "collection": out.collection,
+            "accepted": out.accepted,
+            "inserted": out.inserted,
+        }))),
+        Err(BatchError::Rejected(r)) => Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({
+                "error": r.reason,
+                "index": r.index,
+                "id": r.id,
+            }),
+        }),
+        Err(BatchError::Persist(msg)) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)),
+    }
+}
+
+/// `POST /versions`：保存当前各集合数据为只读版本。
+async fn save_version(State(s): State<Arc<Store>>) -> Result<Response, ApiError> {
+    let v = s
+        .save_version()
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": v.id, "saved_at": v.saved_at })),
+    )
+        .into_response())
+}
+
+/// `GET /versions`：列出已保存的版本。
+async fn list_versions(State(s): State<Arc<Store>>) -> Json<Value> {
+    let versions: Vec<Value> = s
+        .list_versions()
+        .into_iter()
+        .map(|v| json!({ "id": v.id, "saved_at": v.saved_at }))
+        .collect();
+    Json(json!({ "versions": versions }))
+}
+
+/// `GET /versions/{id}`：版本详情（含集合名列表）。
+async fn get_version(
+    State(s): State<Arc<Store>>,
+    Path(id): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    let d = s
+        .get_version(id)
+        .map_err(|e| lookup_error(e, "version", id))?;
+    let mut collections = d.collections;
+    collections.sort();
+    Ok(Json(json!({
+        "id": d.id,
+        "saved_at": d.saved_at,
+        "collections": collections,
+    })))
+}
+
+/// `GET /versions/{id}/collections/{collection}/records`：查询版本内集合的全部记录。
+async fn read_records(
+    State(s): State<Arc<Store>>,
+    Path((version_id, collection)): Path<(u64, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let records = s
+        .read_records(version_id, &collection)
+        .map_err(|e| lookup_error(e, &collection, version_id))?;
+    Ok(Json(json!({
+        "version": version_id,
+        "collection": collection,
+        "records": records,
+    })))
+}
+
+/// 便于组合状态码与响应体。
+fn lookup_error(e: LookupError, collection: &str, version: u64) -> ApiError {
+    match e {
+        LookupError::VersionNotFound => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("version {version} not found"),
+        ),
+        LookupError::CollectionNotFound => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("collection \"{collection}\" not found in version {version}"),
+        ),
+    }
+}
+
+fn app(store: Arc<Store>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/version", get(version))
+        .route(
+            "/collections/{collection}/records",
+            axum::routing::post(write_records),
+        )
+        .route(
+            "/versions",
+            axum::routing::post(save_version).get(list_versions),
+        )
+        .route("/versions/{id}", get(get_version))
+        .route(
+            "/versions/{id}/collections/{collection}/records",
+            get(read_records),
+        )
+        .with_state(store)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/version", get(version));
+    let data_dir = env::var("VDE_DATA").unwrap_or_else(|_| "data".to_owned());
+    let store = Arc::new(Store::open(&data_dir)?);
 
-    println!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app)
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    println!(
+        "Listening on http://{} (data dir: {})",
+        listener.local_addr()?,
+        data_dir
+    );
+    axum::serve(listener, app(store))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod http_tests;
