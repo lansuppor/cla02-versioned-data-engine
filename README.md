@@ -30,6 +30,7 @@ VDE_BIND=127.0.0.1:8080 VDE_DATA=./data cargo run --locked
 | `/versions` | GET | 列出全部已保存版本 |
 | `/versions/{id}` | GET | 查询单个版本的详情（含集合名列表） |
 | `/versions/{id}/collections/{集合名}/records` | GET | 查询某版本内某集合的全部记录 |
+| `/versions/{id}/collections/{集合名}/records/query` | GET | 按 JSON 条件对象筛选某版本内某集合的记录（只读） |
 | `/versions/{起始版本}/collections/{集合名}/diff/{目标版本}` | GET | 比较同一集合在两个已保存版本之间的差异 |
 
 记录是带唯一字符串主键 `id` 的 JSON 对象；字段值可以是字符串、整数、布尔值、`null` 或
@@ -146,6 +147,37 @@ curl -s http://127.0.0.1:8080/versions/1
 {"error":"collection \"orders\" not found in version 1"}
 ```
 
+### 按条件查询版本内记录
+
+```sh
+curl -s http://127.0.0.1:8080/versions/1/collections/users/records/query \
+  -H 'Content-Type: application/json' \
+  -d '{"active":true,"meta.role":"admin"}'
+# {"version":1,"collection":"users","records":[{"id":"u1", ...}]}
+```
+
+请求体是一个 JSON 条件对象，字段名对应记录的字段路径，值给出期望值；同一对象内的
+多个条件为 AND 关系，全部命中才返回该记录：
+
+- 期望值是字符串、整数、布尔或 `null` 时，记录该路径上的值与之**完全相等**才命中；
+  类型不同不命中（如期望 `36` 不命中 `"36"`）。
+- 期望值是嵌套对象时，它表示**子条件**而不是要相等的值：要求记录对应字段是对象，
+  且逐个满足其给出的子条件（记录可带有子条件之外的额外字段）；嵌套层数不限。
+  例如 `{"meta":{"role":"admin"}}` 与 `{"meta.role":"admin"}` 等价。
+- 字段路径是用点连接的嵌套字段名序列（如 `"meta.role"`）；路径中某一层缺失或
+  不是对象时不命中，不报错。
+- 条件为空对象 `{}` 时不做筛选，返回该版本该集合的全部记录。
+
+同一条件对象内出现重复字段名时整批拒绝（HTTP 400），不返回部分结果；响应给出
+`error` 与点连接的完整字段路径 `field`（不含 `id`）：
+
+```text
+{"error":"duplicate field \"meta.role\" in query conditions","field":"meta.role"}
+```
+
+查询是只读操作：不生成新版本、不改变任何记录；版本/集合不存在的 404 语义、
+结果中记录的顺序与字段顺序均与既有版本查询接口一致（保持写入时的字段顺序）。
+
 ### 比较两个版本的差异
 
 ```sh
@@ -206,6 +238,8 @@ cargo test
 ```
 
 覆盖：整批原子性与各类校验拒绝、快照只读与字段顺序、版本/集合不存在报错、
+按条件查询（标量严格相等、点路径与嵌套子条件、空条件返回全部、重复字段整批拒绝、
+只读不生成新版本）、
 版本差异（added/dropped/changed、排序、顺序与存在性错误）、
 同主键替换（replaced/inserted 计数、原子性、字段顺序、历史版本不变与重启恢复）、
 按主键删除（deleted/missing 计数与幂等、空数组/非字符串/重复主键/与 records 同现的

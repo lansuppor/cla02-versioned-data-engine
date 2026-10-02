@@ -546,6 +546,26 @@ impl Store {
             .ok_or(LookupError::CollectionNotFound)
     }
 
+    /// 按条件查询指定版本内指定集合的记录（只读：不生成新版本、不改变任何数据）。
+    ///
+    /// 条件对象的字段名是点连接的字段路径（如 "meta.role"）；期望值为标量
+    /// （字符串、整数、布尔、null）时要求记录该路径上的值与之完全相等（类型不同
+    /// 不命中）；期望值为对象时表示子条件，要求记录对应字段是对象且逐个满足
+    /// 子条件，嵌套层数不限。路径中某一层缺失或不是对象时不命中，不报错。
+    /// 空条件对象不做筛选，返回全部记录。返回记录保持写入时的字段顺序。
+    pub fn query_records(
+        &self,
+        version_id: u64,
+        collection: &str,
+        conditions: &Map<String, Value>,
+    ) -> Result<Vec<Record>, LookupError> {
+        let records = self.read_records(version_id, collection)?;
+        Ok(records
+            .into_iter()
+            .filter(|r| record_matches(r, conditions))
+            .collect())
+    }
+
     /// 比较同一集合在两个已保存版本之间的差异。
     ///
     /// 只读取快照，不生成新版本、不改写任何数据。记录内容比较与写入冲突检测一致：
@@ -758,6 +778,35 @@ fn truncate_wal(wal: &mut fs::File, wal_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 按点连接的路径在嵌套对象中逐层取值；任一层缺失或不是对象时返回 None。
+fn get_path<'a>(mut obj: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segs = path.split('.').peekable();
+    while let Some(seg) = segs.next() {
+        let v = obj.get(seg)?;
+        if segs.peek().is_none() {
+            return Some(v);
+        }
+        obj = v.as_object()?;
+    }
+    None
+}
+
+/// 记录是否满足整组条件：所有条件都命中才匹配（AND 语义）。
+///
+/// 期望值为嵌套对象时表示子条件：记录对应路径上的值必须是对象，且递归满足
+/// 全部子条件（记录可以带有子条件之外的额外字段）；期望值为标量时按 `Value`
+/// 相等判定——类型不同不命中（如期望 36 不命中 "36"），对象比较时字段顺序
+/// 不影响判定，与记录比较规则一致。
+fn record_matches(rec: &Record, conditions: &Map<String, Value>) -> bool {
+    conditions.iter().all(|(path, expected)| match expected {
+        Value::Object(sub) => match get_path(rec, path) {
+            Some(Value::Object(obj)) => record_matches(obj, sub),
+            _ => false,
+        },
+        scalar => get_path(rec, path) == Some(scalar),
+    })
+}
+
 /// 递归校验字段值：仅允许字符串、整数、布尔、null 与嵌套对象；
 /// 浮点数与数组一律拒绝。
 fn validate_value(v: &Value) -> Result<(), String> {
@@ -911,6 +960,88 @@ mod unit_tests {
         ));
         assert!(matches!(
             store.read_records(v1.id, "missing"),
+            Err(LookupError::CollectionNotFound)
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn query_records_filters_by_conditions() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch(
+                "users",
+                &[
+                    json!({"id": "u1", "name": "Ada", "age": 36, "active": true, "meta": {"role": "admin", "score": 10}}),
+                    json!({"id": "u2", "name": "Lin", "age": 28, "active": false, "meta": null}),
+                    json!({"id": "u3", "name": "Ada", "age": 36, "active": false, "meta": {"role": "user"}}),
+                    json!({"id": "u4", "a": {"b": {"c": {"d": 7}}}}),
+                ],
+                false,
+            )
+            .unwrap();
+        let v = store.save_version().unwrap();
+
+        let q = |conds: Value| {
+            store
+                .query_records(v.id, "users", conds.as_object().unwrap())
+                .unwrap()
+        };
+
+        // 标量相等：字符串、整数、布尔、null。
+        assert_eq!(ids_of(&q(json!({"name": "Ada"}))), vec!["u1", "u3"]);
+        assert_eq!(ids_of(&q(json!({"age": 36}))), vec!["u1", "u3"]);
+        assert_eq!(ids_of(&q(json!({"active": true}))), vec!["u1"]);
+        assert_eq!(ids_of(&q(json!({"meta": null}))), vec!["u2"]);
+
+        // 类型不同不命中：期望 "36" 不命中整数 36，期望整数不命中字符串。
+        assert!(q(json!({"age": "36"})).is_empty());
+        assert!(q(json!({"name": 0})).is_empty());
+
+        // 点连接的字段路径命中嵌套值。
+        assert_eq!(ids_of(&q(json!({"meta.role": "admin"}))), vec!["u1"]);
+
+        // 嵌套对象表示子条件：记录对应字段须为对象且满足全部子条件；
+        // 记录可带有子条件之外的额外字段（u1 的 meta 还有 score）。
+        assert_eq!(ids_of(&q(json!({"meta": {"role": "admin"}}))), vec!["u1"]);
+        assert_eq!(
+            ids_of(&q(json!({"meta": {"role": "admin", "score": 10}}))),
+            vec!["u1"]
+        );
+        // meta 为 null（u2）或子条件不满足（u3）都不命中。
+        assert!(q(json!({"meta": {"role": "admin"}, "active": false})).is_empty());
+
+        // 路径中间层缺失或不是对象：不命中，不报错。
+        assert!(q(json!({"meta.role.x": 1})).is_empty());
+        assert!(q(json!({"missing.path": 1})).is_empty());
+        assert!(q(json!({"meta.role": {"x": 1}})).is_empty());
+
+        // 期望标量遇上记录中的对象：不相等，不命中。
+        assert!(q(json!({"meta": "admin"})).is_empty());
+
+        // 多条件 AND；空条件对象不做筛选，返回全部记录。
+        assert_eq!(
+            ids_of(&q(json!({"name": "Ada", "active": true}))),
+            vec!["u1"]
+        );
+        assert_eq!(ids_of(&q(json!({}))), vec!["u1", "u2", "u3", "u4"]);
+
+        // 深层嵌套：子条件与点路径可任意组合，层数不限。
+        assert_eq!(ids_of(&q(json!({"a.b.c.d": 7}))), vec!["u4"]);
+        assert_eq!(ids_of(&q(json!({"a": {"b": {"c": {"d": 7}}}}))), vec!["u4"]);
+        assert_eq!(ids_of(&q(json!({"a": {"b.c": {"d": 7}}}))), vec!["u4"]);
+        assert!(q(json!({"a": {"b": {"c": {"d": 8}}}})).is_empty());
+
+        // 只读：不生成新版本；版本/集合缺失的报错与 read_records 一致。
+        assert_eq!(store.list_versions().len(), 1);
+        assert!(matches!(
+            store.query_records(999, "users", &Map::new()),
+            Err(LookupError::VersionNotFound)
+        ));
+        assert!(matches!(
+            store.query_records(v.id, "missing", &Map::new()),
             Err(LookupError::CollectionNotFound)
         ));
 
