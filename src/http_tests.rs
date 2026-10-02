@@ -696,6 +696,175 @@ async fn replace_survives_restart_over_http() {
     assert_eq!(u1["v"], 100);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_records_endpoint() {
+    let s = spawn_server().await;
+
+    let post = |body: &'static str| {
+        let addr = s.addr.clone();
+        tokio::task::spawn_blocking(move || {
+            request(&addr, "POST", "/collections/users/records", Some(body))
+        })
+    };
+
+    // 初始数据并保存版本 1。
+    let r = post(r#"{"records":[{"id":"u1","v":1},{"id":"u2","v":2},{"id":"u3","v":3}]}"#)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v1 = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+
+    // 删除一条存在、一条不存在：deleted/missing 分别计数，缺失幂等不报错。
+    let r = post(r#"{"delete":["u1","ghost"]}"#).await.unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["collection"], "users");
+    assert_eq!(r.body["accepted"], 2);
+    assert_eq!(r.body["deleted"], 1);
+    assert_eq!(r.body["missing"], 1);
+
+    // 重复删除：幂等，全部计入 missing。
+    let r = post(r#"{"delete":["u1"]}"#).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["deleted"], 0);
+    assert_eq!(r.body["missing"], 1);
+
+    // delete 与 records 同时出现：整批拒绝，无任何效果。
+    let r = post(r#"{"records":[{"id":"u9"}],"delete":["u2"]}"#)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 400);
+    // 空 delete 数组。
+    let r = post(r#"{"delete":[]}"#).await.unwrap();
+    assert_eq!(r.status, 400);
+    // 非字符串元素：给出 index 与 error。
+    let r = post(r#"{"delete":["u2",42]}"#).await.unwrap();
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 1);
+    assert!(r.body["error"].as_str().unwrap().contains("string"));
+    // 空字符串元素。
+    let r = post(r#"{"delete":[""]}"#).await.unwrap();
+    assert_eq!(r.status, 400);
+    // 批内主键重复。
+    let r = post(r#"{"delete":["u2","u2"]}"#).await.unwrap();
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["index"], 1);
+    assert_eq!(r.body["id"], "u2");
+    assert!(r.body["error"].as_str().unwrap().contains("duplicate"));
+
+    // 上述拒绝均未生效：u2/u3 仍在；保存版本 2。
+    let v2 = request(&s.addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let ids: Vec<_> = r.body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rec| rec["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["u2", "u3"]);
+
+    // 已保存版本不变；v1→v2 差异中被删除的 u1 出现在 added（before 为旧记录）。
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.body["records"].as_array().unwrap().len(), 3);
+    let r = request(
+        &s.addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let added = r.body["added"].as_array().unwrap();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["id"], "u1");
+    assert_eq!(added[0]["v"], 1);
+    assert_eq!(r.body["dropped"].as_array().unwrap().len(), 0);
+    assert_eq!(r.body["changed"].as_array().unwrap().len(), 0);
+
+    // 删除后再写入同主键同内容：算新增插入。
+    let r = post(r#"{"records":[{"id":"u1","v":1}]}"#).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["inserted"], 1);
+    // 缺省（无 delete）时响应字段与原来完全一致。
+    assert!(r.body.get("deleted").is_none());
+    assert!(r.body.get("missing").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_survives_restart_over_http() {
+    let dir = tempfile::TempDir::new();
+    let v1;
+    {
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app(store)).await.unwrap();
+        });
+        request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"records":[{"id":"u1","v":1},{"id":"u2","v":2}]}"#),
+        );
+        v1 = request(&addr, "POST", "/versions", None).body["id"]
+            .as_u64()
+            .unwrap();
+        // 已确认的删除：WAL 追加并 fsync 后才返回 200。
+        let r = request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"delete":["u1"]}"#),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body["deleted"], 1);
+    }
+
+    // 同一数据目录重启。
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app(store)).await.unwrap();
+    });
+
+    // 历史版本仍是删除前的两条。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.body["records"].as_array().unwrap().len(), 2);
+
+    // 当前数据与删除后一致：只剩 u2。
+    let v2 = request(&addr, "POST", "/versions", None).body["id"]
+        .as_u64()
+        .unwrap();
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/records"),
+        None,
+    );
+    let recs = r.body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["id"], "u2");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_and_snapshots_never_see_half_batches() {
     let s = Arc::new(spawn_server().await);

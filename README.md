@@ -25,7 +25,7 @@ VDE_BIND=127.0.0.1:8080 VDE_DATA=./data cargo run --locked
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
-| `/collections/{集合名}/records` | POST | 提交一批记录，全有或全无；`"replace":true` 时允许替换同主键记录；集合首次写入时自动创建 |
+| `/collections/{集合名}/records` | POST | 提交一批记录，全有或全无；`"replace":true` 时允许替换同主键记录；`"delete":[主键…]` 时按主键删除记录；集合首次写入时自动创建 |
 | `/versions` | POST | 把当前各集合数据固化为只读版本，返回版本标识与保存时间 |
 | `/versions` | GET | 列出全部已保存版本 |
 | `/versions/{id}` | GET | 查询单个版本的详情（含集合名列表） |
@@ -86,6 +86,31 @@ curl -s -X POST http://127.0.0.1:8080/collections/users/records \
 `replaced`）。同一批内主键重复、记录非法、空批次等校验与 `replace=false` 完全一致，
 任一条不合法时整批不生效，不会发生部分替换。带替换的批次同样先追加到 WAL 并 fsync
 才确认成功，重启后已确认的替换与替换后的当前数据一致。
+
+### 删除误导入的记录
+
+请求体可选字段 `delete`（字符串主键数组，默认缺省）。缺省时行为与上述写入完全一致；
+非空时表示该请求是删除请求，按数组中的主键逐条删除当前数据中的记录。主键在集合中
+不存在时保持幂等：计入 `missing`，不计数也不报错。
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/collections/users/records \
+  -H 'Content-Type: application/json' \
+  -d '{"delete":["u2","no-such-id"]}'
+# {"collection":"users","accepted":2,"deleted":1,"missing":1}
+```
+
+响应字段：`deleted` 为实际被删除的条数，`missing` 为给定主键中集合里不存在的条数，
+`collection` 与 `accepted`（整批大小）含义与写入响应一致。`delete` 为空数组、含非
+字符串或空字符串元素、批内主键重复、或与 `records` 同时出现时，整批拒绝（HTTP 400，
+同样给出 `index`、`error` 与 `id`），不产生任何效果。
+
+删除只影响当前数据：已保存版本永不改变，之后保存的版本与旧版本做差异比较时，被删除
+的记录出现在 `added` 中（`before` 为旧记录语义不变）。删除后再写入同主键同内容记录
+算新增插入，同主键不同内容仍按上述 replace 规则处理。删除请求与写入批次一样先追加
+到 WAL 并 fsync 后才确认成功：未确认的删除在重启后不产生任何效果，已确认的删除在
+重启后与删除后的当前数据一致；并发写入与保存版本时，一个删除请求要么整批生效、
+要么完全不生效，快照不会出现部分删除。
 
 ### 保存版本
 
@@ -181,4 +206,6 @@ cargo test
 覆盖：整批原子性与各类校验拒绝、快照只读与字段顺序、版本/集合不存在报错、
 版本差异（added/dropped/changed、排序、顺序与存在性错误）、
 同主键替换（replaced/inserted 计数、原子性、字段顺序、历史版本不变与重启恢复）、
+按主键删除（deleted/missing 计数、缺失幂等、校验拒绝、历史版本不变与重启恢复、
+未确认删除的 WAL 截断）、
 并发写入与快照的无半批一致性、重启恢复与残缺 WAL 截断。

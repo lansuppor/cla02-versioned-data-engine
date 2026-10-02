@@ -58,26 +58,68 @@ impl IntoResponse for ApiError {
 
 #[derive(Deserialize)]
 struct WriteRequest {
-    records: Vec<Value>,
+    /// 写入批次；与 `delete` 互斥，二者同时出现整批拒绝。
+    #[serde(default)]
+    records: Option<Vec<Value>>,
+    /// 删除批次（字符串主键数组）；缺省时本请求为普通写入，行为与原来完全一致。
+    #[serde(default)]
+    delete: Option<Vec<Value>>,
     /// 是否允许用新内容替换同主键的已有记录；缺省为 false，行为与不支持替换时一致。
     #[serde(default)]
     replace: bool,
 }
 
-/// `POST /collections/{collection}/records`：提交一批记录（全有或全无）。
+/// `POST /collections/{collection}/records`：提交一批记录或一批删除（全有或全无）。
 async fn write_records(
     State(s): State<Arc<Store>>,
     Path(collection): Path<String>,
     payload: Result<Json<WriteRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(req) = payload.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
-    if req.records.is_empty() {
+
+    // 删除请求：delete 非空时表示按主键删除当前数据中的记录。
+    if let Some(delete) = &req.delete {
+        if req.records.is_some() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "\"delete\" and \"records\" cannot appear in the same request",
+            ));
+        }
+        if delete.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "delete must be a non-empty array",
+            ));
+        }
+        return match s.delete_batch(&collection, delete) {
+            Ok(out) => Ok(Json(json!({
+                "collection": out.collection,
+                "accepted": out.accepted,
+                "deleted": out.deleted,
+                "missing": out.missing,
+            }))),
+            Err(BatchError::Rejected(r)) => Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({
+                    "error": r.reason,
+                    "index": r.index,
+                    "id": r.id,
+                }),
+            }),
+            Err(BatchError::Persist(msg)) => {
+                Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg))
+            }
+        };
+    }
+
+    let records = req.records.unwrap_or_default();
+    if records.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "records must be a non-empty array",
         ));
     }
-    match s.write_batch(&collection, &req.records, req.replace) {
+    match s.write_batch(&collection, &records, req.replace) {
         Ok(out) => {
             // replace=false（或缺省）时响应与原来完全一致；仅替换模式附加 "replaced"。
             let mut body = json!({

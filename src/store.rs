@@ -3,7 +3,7 @@
 //! 持久化采用“快照文件 + 追加式 WAL”：
 //! - `snapshot.json` 以“临时文件 + 原子重命名”落盘，包含全部已保存版本及其快照数据、
 //!   以及保存时刻各集合的当前数据；
-//! - `wal.log` 逐行追加已确认提交的批量写入（每行一个 JSON，以换行结尾）；
+//! - `wal.log` 逐行追加已确认提交的批量写入或批量删除（每行一个 JSON，以换行结尾）；
 //! - 启动时先恢复快照，再顺序重放 WAL；末尾若存在崩溃残留的残缺行则截断，
 //!   因此未完成（未 fsync）的写入在重启后不会产生任何记录。
 //!
@@ -87,6 +87,17 @@ pub struct WriteOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DeleteOutcome {
+    pub collection: String,
+    /// 批次中被接受的主键数（等于整批大小）。
+    pub accepted: usize,
+    /// 实际被删除的记录数。
+    pub deleted: usize,
+    /// 给定主键中集合里不存在的条数（幂等，不计数也不报错之外的任何效果）。
+    pub missing: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VersionSummary {
     pub id: u64,
     /// 保存时间（Unix 纪元毫秒）。
@@ -118,6 +129,21 @@ struct CommitEvent {
     records: Vec<Record>,
     #[serde(default)]
     replace: bool,
+}
+
+/// WAL 中的删除事件：已确认提交的一批待删除主键。
+#[derive(Serialize, Deserialize)]
+struct DeleteEvent {
+    collection: String,
+    delete: Vec<String>,
+}
+
+/// WAL 一行的内容：写入提交或删除提交（两种事件的字段互斥，可无歧义区分）。
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WalEvent {
+    Commit(CommitEvent),
+    Delete(DeleteEvent),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -208,9 +234,14 @@ impl Store {
                     break;
                 };
                 let line = &rest[..nl];
-                match serde_json::from_str::<CommitEvent>(line) {
-                    Ok(event) => {
+                match serde_json::from_str::<WalEvent>(line) {
+                    Ok(WalEvent::Commit(event)) => {
                         apply_commit(&mut current, event.collection, event.records);
+                        valid_bytes += nl + 1;
+                        rest = &rest[nl + 1..];
+                    }
+                    Ok(WalEvent::Delete(event)) => {
+                        apply_delete(&mut current, &event.collection, &event.delete);
                         valid_bytes += nl + 1;
                         rest = &rest[nl + 1..];
                     }
@@ -347,11 +378,11 @@ impl Store {
         }
 
         // 阶段 3：先持久化（追加 WAL 并 fsync），成功后才更新内存并确认成功。
-        let event = CommitEvent {
+        let event = WalEvent::Commit(CommitEvent {
             collection: collection.to_string(),
             records: prepared.clone(),
             replace,
-        };
+        });
         append_wal(&mut st.wal, &event).map_err(BatchError::Persist)?;
 
         let existing = st.current.entry(collection.to_string()).or_default();
@@ -379,6 +410,92 @@ impl Store {
             accepted: batch.len(),
             inserted,
             replaced,
+        })
+    }
+
+    /// 批量删除：按主键逐条删除当前数据中的记录，整批校验通过后原子提交。
+    ///
+    /// 主键在集合中不存在时保持幂等（计入 `missing`，不报错）；空批次、非字符串或
+    /// 空字符串主键、批内主键重复都整批拒绝，已有数据不变。删除只影响当前数据，
+    /// 已保存版本永不改变。与写入一样先追加 WAL 并 fsync 后才确认成功。
+    pub fn delete_batch(
+        &self,
+        collection: &str,
+        batch: &[Value],
+    ) -> Result<DeleteOutcome, BatchError> {
+        if collection.is_empty() {
+            return Err(BatchError::Rejected(Rejection {
+                index: 0,
+                id: None,
+                reason: "collection name must not be empty".to_string(),
+            }));
+        }
+        if batch.is_empty() {
+            return Err(BatchError::Rejected(Rejection {
+                index: 0,
+                id: None,
+                reason: "delete must be a non-empty array".to_string(),
+            }));
+        }
+
+        let mut st = self.inner.lock().unwrap();
+
+        // 阶段 1：逐条校验主键；任何失败都直接返回，状态未做任何修改。
+        let mut seen: HashMap<&str, usize> = HashMap::with_capacity(batch.len());
+        let mut ids: Vec<String> = Vec::with_capacity(batch.len());
+        for (i, raw) in batch.iter().enumerate() {
+            let id = match raw {
+                Value::String(s) if !s.is_empty() => s.as_str(),
+                Value::String(_) => {
+                    return Err(BatchError::Rejected(Rejection {
+                        index: i,
+                        id: None,
+                        reason: "primary key must be a non-empty string".to_string(),
+                    }));
+                }
+                _ => {
+                    return Err(BatchError::Rejected(Rejection {
+                        index: i,
+                        id: None,
+                        reason: "primary key must be a string".to_string(),
+                    }));
+                }
+            };
+            if let Some(&first) = seen.get(id) {
+                return Err(BatchError::Rejected(Rejection {
+                    index: i,
+                    id: Some(id.to_string()),
+                    reason: format!(
+                        "duplicate id \"{id}\" in the same batch (first at index {first})"
+                    ),
+                }));
+            }
+            seen.insert(id, i);
+            ids.push(id.to_string());
+        }
+
+        // 阶段 2：先持久化（追加 WAL 并 fsync），成功后才更新内存并确认成功。
+        let event = WalEvent::Delete(DeleteEvent {
+            collection: collection.to_string(),
+            delete: ids.clone(),
+        });
+        append_wal(&mut st.wal, &event).map_err(BatchError::Persist)?;
+
+        let mut deleted = 0usize;
+        if let Some(records) = st.current.get_mut(collection) {
+            let before = records.len();
+            records.retain(|r| {
+                let id = r["id"].as_str().expect("validated record");
+                !ids.iter().any(|d| d == id)
+            });
+            deleted = before - records.len();
+        }
+
+        Ok(DeleteOutcome {
+            collection: collection.to_string(),
+            accepted: ids.len(),
+            deleted,
+            missing: ids.len() - deleted,
         })
     }
 
@@ -537,7 +654,17 @@ fn apply_commit(
     }
 }
 
-fn append_wal(wal: &mut fs::File, event: &CommitEvent) -> Result<(), String> {
+/// WAL 重放/应用删除：按主键移除当前数据中的记录；不存在的集合/主键为空操作。
+fn apply_delete(current: &mut BTreeMap<String, Vec<Record>>, collection: &str, ids: &[String]) {
+    if let Some(records) = current.get_mut(collection) {
+        records.retain(|r| {
+            let id = r["id"].as_str().expect("validated record");
+            !ids.iter().any(|d| d == id)
+        });
+    }
+}
+
+fn append_wal(wal: &mut fs::File, event: &WalEvent) -> Result<(), String> {
     let mut line = serde_json::to_vec(event).map_err(|e| format!("encode wal: {e}"))?;
     line.push(b'\n');
     wal.write_all(&line)
@@ -1199,6 +1326,194 @@ mod unit_tests {
             .map(|r| r["id"].as_str().unwrap())
             .collect();
         assert_eq!(dropped, vec!["u3"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_removes_records_and_counts_missing() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch(
+                "users",
+                &[
+                    json!({"id": "u1", "v": 1}),
+                    json!({"id": "u2", "v": 2}),
+                    json!({"id": "u3", "v": 3}),
+                ],
+                false,
+            )
+            .unwrap();
+        let v1 = store.save_version().unwrap();
+
+        // 删除一条存在、一条不存在：deleted/missing 分别计数，不报错。
+        let out = store
+            .delete_batch("users", &[json!("u1"), json!("ghost")])
+            .unwrap();
+        assert_eq!(out.accepted, 2);
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.missing, 1);
+
+        // 重复删除同一主键：幂等，全部计入 missing。
+        let out = store.delete_batch("users", &[json!("u1")]).unwrap();
+        assert_eq!(out.deleted, 0);
+        assert_eq!(out.missing, 1);
+
+        // 不存在的集合：全部 missing，不报错也不创建集合。
+        let out = store.delete_batch("nope", &[json!("x")]).unwrap();
+        assert_eq!(out.deleted, 0);
+        assert_eq!(out.missing, 1);
+        let v_tmp = store.save_version().unwrap();
+        assert!(matches!(
+            store.read_records(v_tmp.id, "nope"),
+            Err(LookupError::CollectionNotFound)
+        ));
+
+        // 已保存版本不变；之后保存的版本与旧版本比较时，被删除记录出现在 added。
+        let v2 = store.save_version().unwrap();
+        assert_eq!(store.read_records(v1.id, "users").unwrap().len(), 3);
+        let recs = store.read_records(v2.id, "users").unwrap();
+        let ids: Vec<_> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["u2", "u3"]);
+        let d = store.diff_versions(v1.id, v2.id, "users").unwrap();
+        let added: Vec<_> = d.added.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(added, vec!["u1"]);
+        assert_eq!(
+            Value::Object(d.added[0].clone()),
+            json!({"id": "u1", "v": 1})
+        );
+        assert!(d.dropped.is_empty() && d.changed.is_empty());
+
+        // 删除后再写入同主键同内容：算新增插入。
+        let out = store
+            .write_batch("users", &[json!({"id": "u1", "v": 1})], false)
+            .unwrap();
+        assert_eq!(out.inserted, 1);
+        // 同主键不同内容仍按现有 replace 规则处理（replace=false 拒绝）。
+        let err = store
+            .write_batch("users", &[json!({"id": "u2", "v": 99})], false)
+            .unwrap_err();
+        assert!(matches!(err, BatchError::Rejected(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_batch_is_strictly_atomic_and_validated() {
+        let dir = temp_dir();
+        let store = Store::open(&dir).unwrap();
+        store
+            .write_batch("users", &[json!({"id": "u1"}), json!({"id": "u2"})], false)
+            .unwrap();
+
+        // 空批次。
+        let err = store.delete_batch("users", &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected(r) if r.reason.contains("non-empty")
+        ));
+        // 非字符串元素：给出 index，id 不可识别。
+        let err = store
+            .delete_batch("users", &[json!("u1"), json!(42)])
+            .unwrap_err();
+        match err {
+            BatchError::Rejected(r) => {
+                assert_eq!(r.index, 1);
+                assert_eq!(r.id, None);
+                assert!(r.reason.contains("string"));
+            }
+            BatchError::Persist(e) => panic!("{e}"),
+        }
+        // 空字符串元素。
+        let err = store.delete_batch("users", &[json!("")]).unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Rejected(r) if r.reason.contains("non-empty string")
+        ));
+        // 批内主键重复。
+        let err = store
+            .delete_batch("users", &[json!("u1"), json!("u1")])
+            .unwrap_err();
+        match err {
+            BatchError::Rejected(r) => {
+                assert_eq!(r.index, 1);
+                assert_eq!(r.id.as_deref(), Some("u1"));
+                assert!(r.reason.contains("duplicate id"));
+            }
+            BatchError::Persist(e) => panic!("{e}"),
+        }
+
+        // 所有拒绝都不产生任何效果：u1/u2 仍在。
+        let v = store.save_version().unwrap();
+        assert_eq!(store.read_records(v.id, "users").unwrap().len(), 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_survives_restart_and_keeps_old_versions() {
+        let dir = temp_dir();
+        let v1_id;
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .write_batch(
+                    "users",
+                    &[json!({"id": "u1", "v": 1}), json!({"id": "u2", "v": 2})],
+                    false,
+                )
+                .unwrap();
+            v1_id = store.save_version().unwrap().id;
+            // 保存版本之后再删除：历史版本不受影响。
+            let out = store.delete_batch("users", &[json!("u1")]).unwrap();
+            assert_eq!(out.deleted, 1);
+
+            // 删除事件落入 WAL。
+            let wal = fs::read_to_string(dir.join("wal.log")).unwrap();
+            assert!(wal.lines().any(|l| l.contains("\"delete\":[\"u1\"]")));
+        }
+
+        // kill -9 式重开：已确认的删除恢复，已保存版本不变。
+        let store = Store::open(&dir).unwrap();
+        let old = store.read_records(v1_id, "users").unwrap();
+        assert_eq!(old.len(), 2);
+        let v2 = store.save_version().unwrap();
+        let recs = store.read_records(v2.id, "users").unwrap();
+        let ids: Vec<_> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["u2"]);
+        let d = store.diff_versions(v1_id, v2.id, "users").unwrap();
+        let added: Vec<_> = d.added.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(added, vec!["u1"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unconfirmed_delete_in_truncated_wal_is_discarded() {
+        let dir = temp_dir();
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .write_batch("users", &[json!({"id": "u1"}), json!({"id": "u2"})], false)
+                .unwrap();
+            store.save_version().unwrap();
+        }
+        // 模拟崩溃：追加一段未完成的删除事件（未换行结尾、未 fsync 确认）。
+        let wal_path = dir.join("wal.log");
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        f.write_all(b"{\"collection\":\"users\",\"delete\":[\"u1\"")
+            .unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        // 重启后未确认的删除不产生任何效果。
+        let store = Store::open(&dir).unwrap();
+        let v = store.save_version().unwrap();
+        let recs = store.read_records(v.id, "users").unwrap();
+        let ids: Vec<_> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["u1", "u2"]);
 
         fs::remove_dir_all(&dir).ok();
     }
