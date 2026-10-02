@@ -11,7 +11,7 @@ use std::{env, error::Error, sync::Arc};
 
 mod store;
 
-use store::{BatchError, LookupError, Store};
+use store::{BatchError, DiffError, LookupError, Store};
 
 #[derive(Serialize)]
 struct Health {
@@ -146,6 +146,60 @@ async fn read_records(
     })))
 }
 
+/// `GET /versions/{from}/collections/{collection}/diff/{to}`：
+/// 比较同一集合在两个已保存版本之间的差异（只读，不生成新版本）。
+async fn diff_versions(
+    State(s): State<Arc<Store>>,
+    Path((from, collection, to)): Path<(u64, String, u64)>,
+) -> Result<Json<Value>, ApiError> {
+    let d = s
+        .diff_versions(from, to, &collection)
+        .map_err(|e| diff_error(e, &collection, from, to))?;
+    let changed: Vec<Value> = d
+        .changed
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.before["id"],
+                "before": c.before,
+                "after": c.after,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "from": d.from,
+        "to": d.to,
+        "collection": d.collection,
+        "added": d.added,
+        "dropped": d.dropped,
+        "changed": changed,
+    })))
+}
+
+/// 差异查询的错误映射：版本/集合不存在为 404，起始版本晚于目标版本为 400。
+fn diff_error(e: DiffError, collection: &str, from: u64, to: u64) -> ApiError {
+    match e {
+        DiffError::FromVersionNotFound => {
+            ApiError::new(StatusCode::NOT_FOUND, format!("version {from} not found"))
+        }
+        DiffError::ToVersionNotFound => {
+            ApiError::new(StatusCode::NOT_FOUND, format!("version {to} not found"))
+        }
+        DiffError::CollectionNotFoundInFrom => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("collection \"{collection}\" not found in version {from}"),
+        ),
+        DiffError::CollectionNotFoundInTo => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("collection \"{collection}\" not found in version {to}"),
+        ),
+        DiffError::OutOfOrder => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("start version {from} is later than target version {to}"),
+        ),
+    }
+}
+
 /// 便于组合状态码与响应体。
 fn lookup_error(e: LookupError, collection: &str, version: u64) -> ApiError {
     match e {
@@ -176,6 +230,10 @@ fn app(store: Arc<Store>) -> Router {
         .route(
             "/versions/{id}/collections/{collection}/records",
             get(read_records),
+        )
+        .route(
+            "/versions/{from}/collections/{collection}/diff/{to}",
+            get(diff_versions),
         )
         .with_state(store)
 }

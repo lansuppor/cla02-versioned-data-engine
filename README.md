@@ -30,6 +30,7 @@ VDE_BIND=127.0.0.1:8080 VDE_DATA=./data cargo run --locked
 | `/versions` | GET | 列出全部已保存版本 |
 | `/versions/{id}` | GET | 查询单个版本的详情（含集合名列表） |
 | `/versions/{id}/collections/{集合名}/records` | GET | 查询某版本内某集合的全部记录 |
+| `/versions/{起始版本}/collections/{集合名}/diff/{目标版本}` | GET | 比较同一集合在两个已保存版本之间的差异 |
 
 记录是带唯一字符串主键 `id` 的 JSON 对象；字段值可以是字符串、整数、布尔值、`null` 或
 嵌套对象（不允许浮点数与数组）。返回的记录保持写入时的字段顺序。
@@ -98,6 +99,47 @@ curl -s http://127.0.0.1:8080/versions/1
 {"error":"collection \"orders\" not found in version 1"}
 ```
 
+### 比较两个版本的差异
+
+```sh
+curl -s http://127.0.0.1:8080/versions/1/collections/users/diff/2
+```
+
+路径参数依次为：起始版本 `from`、集合名、目标版本 `to`。版本号随保存动作递增，
+`from` 不得晚于 `to`；`from` 与 `to` 相同版本时三个列表都为空。响应示例：
+
+```json
+{
+  "from": 1,
+  "to": 2,
+  "collection": "users",
+  "added":   [{"id": "u9", "name": "Gone"}],
+  "dropped": [{"id": "u3", "name": "New", "age": 20}],
+  "changed": [{"id": "u1",
+               "before": {"id": "u1", "name": "Ada", "age": 36},
+               "after":  {"id": "u1", "name": "Ada", "age": 37}}]
+}
+```
+
+结果字段含义：
+
+- `added`：仅存在于起始版本的记录（即在目标版本中被删除的记录；先写后删的记录出现在这里）。
+- `dropped`：仅存在于目标版本的记录（即两个版本之间新写入的记录；先删后写的记录出现在这里）。
+- `changed`：两个版本中都存在但内容不同的记录，`id` 为主键，`before`/`after` 分别为
+  修改前（起始版本）与修改后（目标版本）的完整记录。
+
+三个列表内部均按主键 `id` 的字节序升序排列。比较记录内容时字段顺序不影响判定，
+字段名与字段值相同即视为同一条记录。差异查询只读取已保存的快照：不会生成新版本、
+不改写任何记录，也不影响并发写入。
+
+错误处理与查询接口一致，且均不改变任何数据：
+
+- 起始或目标版本不存在：HTTP 404，`{"error":"version 999 not found"}`；
+- 集合在其中任一版本中不存在：HTTP 404，
+  `{"error":"collection \"orders\" not found in version 1"}`；
+- 起始版本晚于目标版本：HTTP 400，
+  `{"error":"start version 2 is later than target version 1"}`。
+
 ## 持久化与崩溃恢复
 
 - 每批确认成功的写入先追加到 `wal.log` 并 fsync，再更新内存；进程崩溃时未落盘的写入
@@ -117,4 +159,5 @@ cargo test
 ```
 
 覆盖：整批原子性与各类校验拒绝、快照只读与字段顺序、版本/集合不存在报错、
+版本差异（added/dropped/changed、排序、顺序与存在性错误）、
 并发写入与快照的无半批一致性、重启恢复与残缺 WAL 截断。

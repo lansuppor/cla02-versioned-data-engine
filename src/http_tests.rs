@@ -99,6 +99,186 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> RawRespo
 // 避免 current-thread 运行时中请求方占满工作线程、服务端无法响应的死锁。
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_endpoint_reports_changes_between_versions() {
+    let dir = tempfile::TempDir::new();
+    let v1;
+    {
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app(store)).await.unwrap();
+        });
+        // v1：u1 将被改、u2 将被删、u3 保持不变。
+        request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(
+                r#"{"records":[
+                    {"id":"u1","name":"Ada","age":36},
+                    {"id":"u2","name":"Lin"},
+                    {"id":"u3","name":"Same"}
+                ]}"#,
+            ),
+        );
+        let r = request(&addr, "POST", "/versions", None);
+        v1 = r.body["id"].as_u64().unwrap();
+        // v1 之后新写入 u4（dropped 场景）。
+        request(
+            &addr,
+            "POST",
+            "/collections/users/records",
+            Some(r#"{"records":[{"id":"u4","name":"New"}]}"#),
+        );
+        // 服务随作用域结束停止，释放 WAL 句柄。
+    }
+
+    // 改写快照当前数据：删除 u2、改写 u1、新增 u5，重启后保存 v2。
+    let snap_path = dir.path().join("snapshot.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snap_path).unwrap()).unwrap();
+    let recs = state["collections"][0]["records"].as_array_mut().unwrap();
+    recs.retain(|r| r["id"] != "u2");
+    for r in recs.iter_mut() {
+        if r["id"] == "u1" {
+            *r = json!({"id": "u1", "name": "Ada", "age": 37, "role": "admin"});
+        }
+    }
+    recs.push(json!({"id": "u5", "name": "Later"}));
+    let mut bytes = serde_json::to_vec(&state).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&snap_path, bytes).unwrap();
+
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app(store)).await.unwrap();
+    });
+
+    let r = request(&addr, "POST", "/versions", None);
+    assert_eq!(r.status, 201);
+    let v2 = r.body["id"].as_u64().unwrap();
+
+    // 正常差异查询。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["from"], v1);
+    assert_eq!(r.body["to"], v2);
+    assert_eq!(r.body["collection"], "users");
+    let added: Vec<_> = r.body["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].clone())
+        .collect();
+    assert_eq!(added, vec![json!("u2")], "先写后删 → added");
+    let dropped: Vec<_> = r.body["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].clone())
+        .collect();
+    assert_eq!(dropped, vec![json!("u4"), json!("u5")], "新写入 → dropped");
+    let changed = r.body["changed"].as_array().unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["before"]["id"], "u1");
+    assert_eq!(changed[0]["before"]["age"], 36);
+    assert_eq!(changed[0]["after"]["age"], 37);
+    assert_eq!(changed[0]["after"]["role"], "admin");
+
+    // 同版本比较：三个列表均为空。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 200);
+    assert!(r.body["added"].as_array().unwrap().is_empty());
+    assert!(r.body["dropped"].as_array().unwrap().is_empty());
+    assert!(r.body["changed"].as_array().unwrap().is_empty());
+
+    // 起始晚于目标：400。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v2}/collections/users/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 400);
+    let msg = r.body["error"].as_str().unwrap();
+    assert!(msg.contains(&v1.to_string()) && msg.contains(&v2.to_string()));
+
+    // 起始版本不存在：404。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/999/collections/users/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.body["error"], json!("version 999 not found"));
+
+    // 目标版本不存在：404。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/diff/999"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.body["error"], json!("version 999 not found"));
+
+    // 集合在起始版本不存在（orders 只在当前期创建）：404。
+    request(
+        &addr,
+        "POST",
+        "/collections/orders/records",
+        Some(r#"{"records":[{"id":"o1"}]}"#),
+    );
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/orders/diff/{v2}"),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(
+        r.body["error"],
+        json!(format!("collection \"orders\" not found in version {v1}"))
+    );
+
+    // 差异查询是只读的：再查一次 v1 视图，数据未变。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v1}/collections/users/records"),
+        None,
+    );
+    assert_eq!(r.body["records"].as_array().unwrap().len(), 3);
+
+    // 顺序检查优先于集合检查：反向且集合缺失，仍报 400 而非 404。
+    let r = request(
+        &addr,
+        "GET",
+        &format!("/versions/{v2}/collections/missing/diff/{v1}"),
+        None,
+    );
+    assert_eq!(r.status, 400);
+
+    // 差异查询不生成新版本：版本总数仍为 2。
+    let r = request(&addr, "GET", "/versions", None);
+    assert_eq!(r.body["versions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_and_version_unchanged() {
     let s = spawn_server().await;
     let h = request(&s.addr, "GET", "/health", None);

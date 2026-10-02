@@ -43,6 +43,17 @@ pub enum LookupError {
     CollectionNotFound,
 }
 
+/// 版本差异查询失败：版本/集合不存在（404）或起始版本晚于目标版本（400）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffError {
+    FromVersionNotFound,
+    ToVersionNotFound,
+    CollectionNotFoundInFrom,
+    CollectionNotFoundInTo,
+    /// 起始版本晚于目标版本（版本号随保存动作递增）。
+    OutOfOrder,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WriteOutcome {
     pub collection: String,
@@ -65,6 +76,27 @@ pub struct VersionDetail {
     pub saved_at: u64,
     /// 该版本快照中包含的集合名。
     pub collections: Vec<String>,
+}
+
+/// 一条内容发生变化的记录：修改前（起始版本）与修改后（目标版本）的完整记录。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedRecord {
+    pub before: Record,
+    pub after: Record,
+}
+
+/// 同一集合在两个已保存版本之间的差异；三个列表均按主键 id 字节序升序。
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffOutcome {
+    pub from: u64,
+    pub to: u64,
+    pub collection: String,
+    /// 仅存在于起始版本的记录（在目标版本中被删除）。
+    pub added: Vec<Record>,
+    /// 仅存在于目标版本的记录（新写入）。
+    pub dropped: Vec<Record>,
+    /// 两个版本中都存在但内容不同的记录。
+    pub changed: Vec<ChangedRecord>,
 }
 
 /// 一个已保存版本的完整只读快照。
@@ -365,6 +397,78 @@ impl Store {
             .get(collection)
             .cloned()
             .ok_or(LookupError::CollectionNotFound)
+    }
+
+    /// 比较同一集合在两个已保存版本之间的差异。
+    ///
+    /// 只读取快照，不生成新版本、不改写任何数据。记录内容比较与写入冲突检测一致：
+    /// 字段顺序不影响判定，字段名与字段值相同即视为同一条记录。
+    pub fn diff_versions(
+        &self,
+        from: u64,
+        to: u64,
+        collection: &str,
+    ) -> Result<DiffOutcome, DiffError> {
+        let st = self.inner.lock().unwrap();
+        let from_v = st
+            .versions
+            .iter()
+            .find(|v| v.id == from)
+            .ok_or(DiffError::FromVersionNotFound)?;
+        let to_v = st
+            .versions
+            .iter()
+            .find(|v| v.id == to)
+            .ok_or(DiffError::ToVersionNotFound)?;
+        if from > to {
+            return Err(DiffError::OutOfOrder);
+        }
+        let from_recs = from_v
+            .data
+            .get(collection)
+            .ok_or(DiffError::CollectionNotFoundInFrom)?;
+        let to_recs = to_v
+            .data
+            .get(collection)
+            .ok_or(DiffError::CollectionNotFoundInTo)?;
+
+        // BTreeMap 迭代顺序即主键 id 的字节序升序。
+        let from_map: BTreeMap<&str, &Record> = from_recs
+            .iter()
+            .map(|r| (r["id"].as_str().expect("validated record"), r))
+            .collect();
+        let to_map: BTreeMap<&str, &Record> = to_recs
+            .iter()
+            .map(|r| (r["id"].as_str().expect("validated record"), r))
+            .collect();
+
+        let mut added = Vec::new();
+        let mut dropped = Vec::new();
+        let mut changed = Vec::new();
+        for (id, before) in &from_map {
+            match to_map.get(id) {
+                None => added.push((*before).clone()),
+                Some(after) if **after != **before => changed.push(ChangedRecord {
+                    before: (*before).clone(),
+                    after: (*after).clone(),
+                }),
+                Some(_) => {}
+            }
+        }
+        for (id, after) in &to_map {
+            if !from_map.contains_key(id) {
+                dropped.push((*after).clone());
+            }
+        }
+
+        Ok(DiffOutcome {
+            from,
+            to,
+            collection: collection.to_string(),
+            added,
+            dropped,
+            changed,
+        })
     }
 
     /// 已保存版本列表（按保存顺序）。
@@ -692,6 +796,151 @@ mod unit_tests {
         let recs = store.read_records(v.id, "users").unwrap();
         let ids: Vec<_> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["u1", "u2"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diff_reports_added_dropped_changed_ignoring_field_order() {
+        let dir = temp_dir();
+
+        // 起始版本 v1：u1（之后被改）、u2/u6（之后被删）、u3（始终不变）。
+        let v1;
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .write_batch(
+                    "users",
+                    &[
+                        json!({"id": "u1", "name": "Ada", "age": 36}),
+                        json!({"id": "u2", "name": "Lin"}),
+                        json!({"id": "u3", "name": "Same", "nested": {"a": 1, "b": 2}}),
+                        json!({"id": "u6", "name": "Gone"}),
+                    ],
+                )
+                .unwrap();
+            v1 = store.save_version().unwrap().id;
+            // v1 之后新写入 u4。
+            store
+                .write_batch("users", &[json!({"id": "u4", "name": "New"})])
+                .unwrap();
+        }
+
+        // 直接改写 snapshot.json 中“当前数据”区段（模拟经外部校正/备份恢复后的分叉状态）：
+        // 删除 u2、u6，改写 u1，新增 u5，再重开保存为 v3。版本区段 v1 保持只读不变。
+        let snap_path = dir.join("snapshot.json");
+        let mut state: Value = serde_json::from_slice(&fs::read(&snap_path).unwrap()).unwrap();
+        let recs = state["collections"][0]["records"].as_array_mut().unwrap();
+        recs.retain(|r| r["id"] != "u2" && r["id"] != "u6");
+        for r in recs.iter_mut() {
+            if r["id"] == "u1" {
+                *r = json!({"id": "u1", "name": "Ada", "age": 37, "role": "admin"});
+            }
+        }
+        recs.push(json!({"id": "u5", "name": "Later"}));
+        let mut bytes = serde_json::to_vec(&state).unwrap();
+        bytes.push(b'\n');
+        fs::write(&snap_path, bytes).unwrap();
+
+        let store = Store::open(&dir).unwrap();
+        let v3 = store.save_version().unwrap().id;
+
+        let d = store.diff_versions(v1, v3, "users").unwrap();
+        // added：先写后删——u2、u6 仅在起始版本，按 id 字节序。
+        let added: Vec<_> = d.added.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(added, vec![json!("u2"), json!("u6")]);
+        // dropped：新写入——u4（WAL 恢复）、u5 仅在目标版本，按 id 字节序。
+        let dropped: Vec<_> = d.dropped.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(dropped, vec![json!("u4"), json!("u5")]);
+        // changed：u1，before/after 为两侧完整记录。
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.changed[0].before["id"], "u1");
+        assert_eq!(d.changed[0].before["age"], 36);
+        assert_eq!(d.changed[0].after["age"], 37);
+        assert_eq!(d.changed[0].after["role"], "admin");
+        // u3 未出现在任何差异列表中。
+
+        // 同版本比较：三个列表均为空。
+        let d = store.diff_versions(v1, v1, "users").unwrap();
+        assert!(d.added.is_empty() && d.dropped.is_empty() && d.changed.is_empty());
+
+        // 反向比较：起始晚于目标 → 拒绝。
+        assert!(matches!(
+            store.diff_versions(v3, v1, "users"),
+            Err(DiffError::OutOfOrder)
+        ));
+
+        // 版本 / 集合不存在。
+        assert!(matches!(
+            store.diff_versions(999, v3, "users"),
+            Err(DiffError::FromVersionNotFound)
+        ));
+        assert!(matches!(
+            store.diff_versions(v1, 999, "users"),
+            Err(DiffError::ToVersionNotFound)
+        ));
+        assert!(matches!(
+            store.diff_versions(v1, v3, "missing"),
+            Err(DiffError::CollectionNotFoundInFrom)
+        ));
+
+        // 字节序验证：id 写入乱序（b、a、aa），起始版本保存后把集合在快照中清空，
+        // 再保存目标版本，added 必须按 "a" < "aa" < "b" 输出。
+        store
+            .write_batch(
+                "items",
+                &[json!({"id": "b"}), json!({"id": "a"}), json!({"id": "aa"})],
+            )
+            .unwrap();
+        let va = store.save_version().unwrap().id;
+        let snap_path = dir.join("snapshot.json");
+        let mut state: Value = serde_json::from_slice(&fs::read(&snap_path).unwrap()).unwrap();
+        for c in state["collections"].as_array_mut().unwrap() {
+            if c["name"] == "items" {
+                c["records"] = json!([]);
+            }
+        }
+        let mut bytes = serde_json::to_vec(&state).unwrap();
+        bytes.push(b'\n');
+        fs::write(&snap_path, bytes).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let vb = store.save_version().unwrap().id;
+        let d = store.diff_versions(va, vb, "items").unwrap();
+        let added: Vec<_> = d.added.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(added, vec!["a", "aa", "b"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // 验证字段顺序不同但字段名/值相同时不判为 changed：构造两条同内容不同字段序的记录
+    // 分处两个版本（通过快照编辑），结果三个列表均为空。
+    #[test]
+    fn diff_ignores_field_order_for_unchanged_records() {
+        let dir = temp_dir();
+        let v1;
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .write_batch(
+                    "users",
+                    &[json!({"id": "u1", "name": "Ada", "nested": {"a": 1, "b": 2}})],
+                )
+                .unwrap();
+            v1 = store.save_version().unwrap().id;
+        }
+        let snap_path = dir.join("snapshot.json");
+        let mut state: Value = serde_json::from_slice(&fs::read(&snap_path).unwrap()).unwrap();
+        state["collections"][0]["records"] = json!([
+            {"nested": {"b": 2, "a": 1}, "name": "Ada", "id": "u1"}
+        ]);
+        let mut bytes = serde_json::to_vec(&state).unwrap();
+        bytes.push(b'\n');
+        fs::write(&snap_path, bytes).unwrap();
+
+        let store = Store::open(&dir).unwrap();
+        let v2 = store.save_version().unwrap().id;
+        let d = store.diff_versions(v1, v2, "users").unwrap();
+        assert!(d.added.is_empty() && d.dropped.is_empty() && d.changed.is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }
